@@ -42,6 +42,8 @@ struct ThreadStats {
     latencies: Vec<u128>,
     errors: u64,
     rows: u64,
+    inserts: u64,
+    updates: u64,
 }
 
 impl ThreadStats {
@@ -50,6 +52,8 @@ impl ThreadStats {
             latencies: Vec::with_capacity(4096),
             errors: 0,
             rows: 0,
+            inserts: 0,
+            updates: 0,
         }
     }
 }
@@ -59,6 +63,12 @@ struct SampleRow {
     title: String,
     text: String,
     vector: String,
+}
+
+#[derive(Copy, Clone)]
+enum OpKind {
+    Insert,
+    Update,
 }
 
 #[tokio::main]
@@ -119,10 +129,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 match result {
-                    Ok(rows) => {
+                    Ok((rows, kind)) => {
                         let micros = op_start.elapsed().as_micros();
                         stats.latencies.push(micros);
                         stats.rows += rows as u64;
+                        match kind {
+                            OpKind::Insert => stats.inserts += 1,
+                            OpKind::Update => stats.updates += 1,
+                        }
                     }
                     Err(e) => {
                         eprintln!("worker error: {}", e);
@@ -140,18 +154,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut all_lat = Vec::new();
     let mut total_errors = 0u64;
     let mut total_rows = 0u64;
+    let mut total_inserts = 0u64;
+    let mut total_updates = 0u64;
 
     for h in handles {
         let s = h.await?;
         all_lat.extend(s.latencies);
         total_errors += s.errors;
         total_rows += s.rows;
+        total_inserts += s.inserts;
+        total_updates += s.updates;
     }
 
     let elapsed = start_time.elapsed();
     let txn_count = all_lat.len() as u64;
     let tps = txn_count as f64 / elapsed.as_secs_f64();
     let index_rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
+    let mix_total = total_inserts + total_updates;
+    let (insert_pct, update_pct) = if mix_total > 0 {
+        (
+            (total_inserts as f64 / mix_total as f64) * 100.0,
+            (total_updates as f64 / mix_total as f64) * 100.0,
+        )
+    } else {
+        (0.0, 0.0)
+    };
 
     println!();
     println!("=== Summary ===");
@@ -162,6 +189,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Total errors   : {}", total_errors);
     println!("OLTP (txn/s)   : {:.2}", tps);
     println!("Index row/s    : {:.2}", index_rows_per_sec);
+    println!(
+        "Mix ratio      : inserts={} ({:.1}%), updates={} ({:.1}%)",
+        total_inserts, insert_pct, total_updates, update_pct
+    );
 
     print_percentiles("write", &mut all_lat);
 
@@ -199,7 +230,7 @@ async fn run_insert(
     rng: &mut impl Rng,
     id_counter: &AtomicU64,
     verbose: bool,
-) -> Result<u32, sqlx::Error> {
+) -> Result<(u32, OpKind), sqlx::Error> {
     let id = id_counter.fetch_add(1, Ordering::Relaxed) as i64;
     let wiki_id = id;
     let paragraph_id = (id % 1000) as i32;
@@ -238,7 +269,7 @@ async fn run_insert(
         .execute(pool)
         .await?;
 
-    Ok(1)
+    Ok((1, OpKind::Insert))
 }
 
 async fn run_update_mixed(
@@ -248,7 +279,7 @@ async fn run_update_mixed(
     rng: &mut impl Rng,
     id_counter: &AtomicU64,
     verbose: bool,
-) -> Result<u32, sqlx::Error> {
+) -> Result<(u32, OpKind), sqlx::Error> {
     let current_max = id_counter.load(Ordering::Relaxed);
     // If there is no data yet, fall back to insert
     if current_max <= 1 || rng.gen_bool(0.5) {
@@ -282,7 +313,7 @@ async fn run_update_mixed(
         .execute(pool)
         .await?;
 
-    Ok(result.rows_affected() as u32)
+    Ok((result.rows_affected() as u32, OpKind::Update))
 }
 
 fn generate_text(rng: &mut impl Rng, target_len: usize) -> String {
