@@ -33,23 +33,39 @@ On startup it will (by default):
   and materialize multiple parquet shards under `./data/raw`;
 - load sampled `title/text/vector` rows from these parquet files into memory;
 - create a table named `wiki_paragraphs_embeddings_YYYYMMDDHHMMSS`;
-- optionally add a FULLTEXT index on `(title, text)` if `--build-index true`.
+- optionally add a FULLTEXT index on `(title, text)` if `--build-index` is provided.
 
 Alternatively, you can skip the dataset download and use randomly generated
 in-memory samples by passing `--use-random-data true`.
 
 ```bash
+# Insert-only workload without FULLTEXT index (default)
+./target/release/wiki-vec-bench \
+  --mode insert-only \
+  --concurrency 16 \
+  --duration 60 \
+  --use-random-data
+
 # Insert-only workload with FULLTEXT index
 ./target/release/wiki-vec-bench \
   --mode insert-only \
   --concurrency 16 \
   --duration 60 \
-  --build-index true
+  --build-index \
+  --use-random-data
 
 # Update-mixed workload without FULLTEXT index
 ./target/release/wiki-vec-bench \
   --mode update-mixed \
   --concurrency 16 \
   --duration 60 \
-  --build-index false
+  --use-random-data
+
+# Update-mixed workload with FULLTEXT index
+./target/release/wiki-vec-bench \
+  --mode update-mixed \
+  --concurrency 16 \
+  --duration 60 \
+  --build-index \
+  --use-random-data
 ```

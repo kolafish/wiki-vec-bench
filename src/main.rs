@@ -30,7 +30,7 @@ struct Args {
     duration: u64,
 
     /// Whether to create FULLTEXT index on (title, text)
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = false)]
     build_index: bool,
 
     /// Enable verbose logging (print individual SQLs)
