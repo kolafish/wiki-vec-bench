@@ -7,6 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use chrono::Local;
+use std::error::Error;
+use std::fs::File;
+use std::path::Path;
+use std::process::Command;
+use csv::ReaderBuilder;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "TiDB OLTP benchmark for wiki_paragraphs_embeddings")]
@@ -44,6 +49,13 @@ impl ThreadStats {
     }
 }
 
+#[derive(Clone)]
+struct SampleRow {
+    title: String,
+    text: String,
+    vector: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -67,6 +79,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect_with(opts)
         .await?;
 
+    // Ensure local data samples exist (download from HF when missing) and load them.
+    let samples = Arc::new(ensure_samples()?);
+    println!("loaded {} samples from ./data", samples.len());
+
     // Create table with timestamp suffix and FULLTEXT index automatically
     let table_name = Arc::new(create_table_with_index(&pool).await?);
     println!("using table: {}", table_name);
@@ -82,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let verbose = args.verbose;
         let id_counter = id_counter.clone();
         let table_name = table_name.clone();
+        let samples = samples.clone();
 
         let handle = tokio::spawn(async move {
             let mut rng = StdRng::from_entropy();
@@ -90,9 +107,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while start_time.elapsed() < run_duration {
                 let op_start = Instant::now();
                 let result = if mode == "insert-only" {
-                    run_insert(&pool, &table_name, &mut rng, &id_counter, verbose).await
+                    run_insert(&pool, &table_name, &samples, &mut rng, &id_counter, verbose).await
                 } else {
-                    run_update_mixed(&pool, &table_name, &mut rng, &id_counter, verbose).await
+                    run_update_mixed(&pool, &table_name, &samples, &mut rng, &id_counter, verbose).await
                 };
 
                 match result {
@@ -172,6 +189,7 @@ fn print_percentiles(name: &str, latencies: &mut Vec<u128>) {
 async fn run_insert(
     pool: &Pool<MySql>,
     table_name: &str,
+    samples: &Arc<Vec<SampleRow>>,
     rng: &mut impl Rng,
     id_counter: &AtomicU64,
     verbose: bool,
@@ -180,12 +198,13 @@ async fn run_insert(
     let wiki_id = id;
     let paragraph_id = (id % 1000) as i32;
 
-    let title = format!("Sample title {}", id);
-    let text = generate_text(rng, 512);
+    let sample = pick_sample(rng, samples);
+    let title = sample.title.clone();
+    let text = sample.text.clone();
     let url = format!("https://example.com/wiki/{}", wiki_id);
     let views: f64 = rng.gen_range(0.0..1_000_000.0);
     let langs: i32 = rng.gen_range(1..10);
-    let vector = generate_vector_string(rng);
+    let vector = sample.vector.clone();
 
     let sql = format!(
         r#"
@@ -219,6 +238,7 @@ async fn run_insert(
 async fn run_update_mixed(
     pool: &Pool<MySql>,
     table_name: &str,
+    samples: &Arc<Vec<SampleRow>>,
     rng: &mut impl Rng,
     id_counter: &AtomicU64,
     verbose: bool,
@@ -226,13 +246,14 @@ async fn run_update_mixed(
     let current_max = id_counter.load(Ordering::Relaxed);
     // If there is no data yet, fall back to insert
     if current_max <= 1 || rng.gen_bool(0.5) {
-        return run_insert(pool, table_name, rng, id_counter, verbose).await;
+        return run_insert(pool, table_name, samples, rng, id_counter, verbose).await;
     }
 
     let target_id = rng.gen_range(1..current_max) as i64;
     let extra_views: f64 = rng.gen_range(0.0..100.0);
-    let new_text = generate_text(rng, 256);
-    let new_vector = generate_vector_string(rng);
+    let sample = pick_sample(rng, samples);
+    let new_text = sample.text.clone();
+    let new_vector = sample.vector.clone();
 
     let sql = format!(
         r#"
@@ -324,5 +345,47 @@ async fn create_table_with_index(pool: &Pool<MySql>) -> Result<String, sqlx::Err
 
     Ok(table_name)
 }
+
+fn ensure_samples() -> Result<Vec<SampleRow>, Box<dyn Error>> {
+    let data_dir = Path::new("data");
+    let samples_path = data_dir.join("samples.csv");
+
+    if !samples_path.exists() {
+        std::fs::create_dir_all(data_dir)?;
+        println!("no ./data/samples.csv found, downloading dataset via Python script...");
+        let status = Command::new("python3")
+            .arg("scripts/download_wiki_embeddings.py")
+            .status()?;
+        if !status.success() {
+            return Err("python scripts/download_wiki_embeddings.py failed".into());
+        }
+    }
+
+    let file = File::open(&samples_path)?;
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(file);
+
+    let mut out = Vec::new();
+    for result in rdr.records() {
+        let record = result?;
+        let title = record.get(0).unwrap_or("").to_string();
+        let text = record.get(1).unwrap_or("").to_string();
+        let vector = record.get(2).unwrap_or("").to_string();
+        out.push(SampleRow { title, text, vector });
+    }
+
+    if out.is_empty() {
+        return Err("no rows loaded from ./data/samples.csv".into());
+    }
+
+    Ok(out)
+}
+
+fn pick_sample<'a>(rng: &mut impl Rng, samples: &'a [SampleRow]) -> &'a SampleRow {
+    let idx = rng.gen_range(0..samples.len());
+    &samples[idx]
+}
+
 
 
