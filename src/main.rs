@@ -389,9 +389,20 @@ fn ensure_samples() -> Result<Vec<SampleRow>, Box<dyn Error>> {
     let data_dir = Path::new("data");
     let raw_dir = data_dir.join("raw");
 
-    if !raw_dir.exists() {
-        std::fs::create_dir_all(&raw_dir)?;
-        println!("no ./data/raw found, downloading dataset via Python script...");
+    // Ensure directory exists
+    std::fs::create_dir_all(&raw_dir)?;
+
+    // Check if there is at least one parquet file; if not, download.
+    let has_parquet = std::fs::read_dir(&raw_dir)?
+        .filter_map(|e| e.ok())
+        .any(|e| e
+            .path()
+            .extension()
+            .and_then(|s| s.to_str())
+            == Some("parquet"));
+
+    if !has_parquet {
+        println!("no parquet files under ./data/raw, downloading dataset via Python script...");
         let status = Command::new("python3")
             .arg("scripts/download_wiki_embeddings.py")
             .status()?;
