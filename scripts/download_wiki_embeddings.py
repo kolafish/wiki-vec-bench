@@ -34,21 +34,7 @@ def main() -> None:
     print(f"Saving full dataset to parquet under {raw_dir} ...", flush=True)
     ds.to_parquet(str(raw_dir))
 
-    n = min(SAMPLE_LIMIT, len(ds))
-    print(f"Writing {n} samples to {samples_csv} ...", flush=True)
-
-    with samples_csv.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["title", "text", "vector"])
-        for i in range(n):
-            row = ds[i]
-            title = row.get("title", "")
-            text = row.get("text", "")
-            emb = row.get("emb", [])
-            vector_str = ",".join(f"{float(x):.6f}" for x in emb)
-            writer.writerow([title, text, vector_str])
-
-    print("Download and preprocessing finished.", flush=True)
+    print("Download finished. Parquet shards are stored under ./data/raw.", flush=True)
 
 
 if __name__ == "__main__":

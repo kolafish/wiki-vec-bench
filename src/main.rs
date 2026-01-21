@@ -11,7 +11,8 @@ use std::error::Error;
 use std::fs::File;
 use std::path::Path;
 use std::process::Command;
-use csv::ReaderBuilder;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use arrow_array::{ArrayRef, StringArray, ListArray, Float32Array};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "TiDB OLTP benchmark for wiki_paragraphs_embeddings")]
@@ -355,11 +356,11 @@ async fn create_table_with_index(pool: &Pool<MySql>, build_index: bool) -> Resul
 
 fn ensure_samples() -> Result<Vec<SampleRow>, Box<dyn Error>> {
     let data_dir = Path::new("data");
-    let samples_path = data_dir.join("samples.csv");
+    let raw_dir = data_dir.join("raw");
 
-    if !samples_path.exists() {
-        std::fs::create_dir_all(data_dir)?;
-        println!("no ./data/samples.csv found, downloading dataset via Python script...");
+    if !raw_dir.exists() {
+        std::fs::create_dir_all(&raw_dir)?;
+        println!("no ./data/raw found, downloading dataset via Python script...");
         let status = Command::new("python3")
             .arg("scripts/download_wiki_embeddings.py")
             .status()?;
@@ -368,30 +369,102 @@ fn ensure_samples() -> Result<Vec<SampleRow>, Box<dyn Error>> {
         }
     }
 
-    let file = File::open(&samples_path)?;
-    let mut rdr = ReaderBuilder::new()
-        .has_headers(true)
-        .from_reader(file);
-
-    let mut out = Vec::new();
-    for result in rdr.records() {
-        let record = result?;
-        let title = record.get(0).unwrap_or("").to_string();
-        let text = record.get(1).unwrap_or("").to_string();
-        let vector = record.get(2).unwrap_or("").to_string();
-        out.push(SampleRow { title, text, vector });
-    }
-
-    if out.is_empty() {
-        return Err("no rows loaded from ./data/samples.csv".into());
-    }
-
-    Ok(out)
+    load_samples_from_parquet(&raw_dir, 200_000)
 }
 
 fn pick_sample<'a>(rng: &mut impl Rng, samples: &'a [SampleRow]) -> &'a SampleRow {
     let idx = rng.gen_range(0..samples.len());
     &samples[idx]
+}
+
+fn load_samples_from_parquet(
+    raw_dir: &Path,
+    max_rows: usize,
+) -> Result<Vec<SampleRow>, Box<dyn Error>> {
+    let mut samples = Vec::new();
+
+    let mut entries: Vec<_> = std::fs::read_dir(raw_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("parquet"))
+        .collect();
+
+    if entries.is_empty() {
+        return Err("no parquet files found under ./data/raw".into());
+    }
+
+    // Deterministic order
+    entries.sort();
+
+    for path in entries {
+        if samples.len() >= max_rows {
+            break;
+        }
+        println!("loading samples from {:?}", path);
+        let file = File::open(&path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let mut reader = builder.with_batch_size(1024).build()?;
+
+        while let Some(batch_result) = reader.next() {
+            let batch = batch_result?;
+            let schema = batch.schema();
+            let title_idx = schema.index_of("title")?;
+            let text_idx = schema.index_of("text")?;
+            let emb_idx = schema.index_of("emb")?;
+
+            let title_arr = batch
+                .column(title_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or("title column is not StringArray")?;
+            let text_arr = batch
+                .column(text_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or("text column is not StringArray")?;
+            let emb_arr = batch
+                .column(emb_idx)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or("emb column is not ListArray")?;
+
+            for row in 0..batch.num_rows() {
+                if samples.len() >= max_rows {
+                    break;
+                }
+
+                let title = title_arr
+                    .value(row)
+                    .to_string();
+                let text = text_arr
+                    .value(row)
+                    .to_string();
+
+                let values: ArrayRef = emb_arr.value(row);
+                let float_arr = values
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or("emb inner values are not Float32Array")?;
+
+                let mut vector = String::new();
+                for i in 0..float_arr.len() {
+                    let v = float_arr.value(i);
+                    if i > 0 {
+                        vector.push(',');
+                    }
+                    vector.push_str(&format!("{:.6}", v));
+                }
+
+                samples.push(SampleRow { title, text, vector });
+            }
+        }
+    }
+
+    if samples.is_empty() {
+        return Err("no samples loaded from parquet files".into());
+    }
+
+    Ok(samples)
 }
 
 
