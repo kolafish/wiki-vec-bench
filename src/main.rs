@@ -64,8 +64,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pool = MySqlPoolOptions::new()
         .max_connections(args.concurrency as u32 + 8)
-        .connect_timeout(Duration::from_secs(10))
-        .acquire_timeout(Duration::from_secs(10))
         .connect_with(opts)
         .await?;
 
@@ -155,8 +153,8 @@ fn print_percentiles(name: &str, latencies: &mut Vec<u128>) {
     latencies.sort_unstable();
     let len = latencies.len() as f64;
     let p50 = latencies[(len * 0.50) as usize];
-    let p95 = latencies[(len * 0.95) as usize.min(latencies.len() - 1)];
-    let p99 = latencies[(len * 0.99) as usize.min(latencies.len() - 1)];
+    let p95 = latencies[((len * 0.95) as usize).min(latencies.len() - 1)];
+    let p99 = latencies[((len * 0.99) as usize).min(latencies.len() - 1)];
     let max = *latencies.last().unwrap();
 
     let to_ms = |us: u128| us as f64 / 1000.0;
@@ -202,7 +200,7 @@ async fn run_insert(
         println!("INSERT id={}", id);
     }
 
-    sqlx::query(sql)
+    sqlx::query(&sql)
         .bind(id)
         .bind(wiki_id)
         .bind(paragraph_id)
@@ -249,7 +247,7 @@ async fn run_update_mixed(
         println!("UPDATE id={}", target_id);
     }
 
-    let result = sqlx::query(sql)
+    let result = sqlx::query(&sql)
         .bind(extra_views)
         .bind(new_text)
         .bind(new_vector)
