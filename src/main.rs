@@ -1,20 +1,16 @@
 use clap::Parser;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
-use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
+use sqlx::mysql::MySqlPoolOptions;
 use sqlx::{MySql, Pool};
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use chrono::Local;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "TiDB OLTP benchmark for wiki_paragraphs_embeddings")]
 struct Args {
-    /// TiDB connection URL, e.g. mysql://user:pwd@host:4000/db
-    #[arg(short, long)]
-    url: String,
-
     /// insert-only or update-mixed
     #[arg(long, value_parser = ["insert-only", "update-mixed"])]
     mode: String,
@@ -26,10 +22,6 @@ struct Args {
     /// Benchmark duration in seconds
     #[arg(short, long, default_value_t = 60)]
     duration: u64,
-
-    /// Logical writer count label (0 / 1 / 2), only used for reporting
-    #[arg(long, default_value_t = 0)]
-    writers: u32,
 
     /// Enable verbose logging (print individual SQLs)
     #[arg(long, default_value_t = false)]
@@ -58,17 +50,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("--- TiDB wiki_paragraphs_embeddings OLTP benchmark ---");
     println!("mode        : {}", args.mode);
-    println!("writers     : {}", args.writers);
     println!("concurrency : {}", args.concurrency);
     println!("duration    : {}s", args.duration);
 
-    let opts = MySqlConnectOptions::from_str(&args.url)?;
+    // Global TiDB connection settings
+    // Equivalent to: mysql --comments --host 127.0.0.1 --port 4000 -u root test
+    let opts = sqlx::mysql::MySqlConnectOptions::new()
+        .host("127.0.0.1")
+        .port(4000)
+        .username("root")
+        .database("test")
+        .charset("utf8mb4");
+
     let pool = MySqlPoolOptions::new()
         .max_connections(args.concurrency as u32 + 8)
         .connect_timeout(Duration::from_secs(10))
         .acquire_timeout(Duration::from_secs(10))
         .connect_with(opts)
         .await?;
+
+    // Create table with timestamp suffix and FULLTEXT index automatically
+    let table_name = Arc::new(create_table_with_index(&pool).await?);
+    println!("using table: {}", table_name);
 
     let id_counter = Arc::new(AtomicU64::new(1));
     let start_time = Instant::now();
@@ -80,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mode = args.mode.clone();
         let verbose = args.verbose;
         let id_counter = id_counter.clone();
+        let table_name = table_name.clone();
 
         let handle = tokio::spawn(async move {
             let mut rng = StdRng::from_entropy();
@@ -88,9 +92,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while start_time.elapsed() < run_duration {
                 let op_start = Instant::now();
                 let result = if mode == "insert-only" {
-                    run_insert(&pool, &mut rng, &id_counter, verbose).await
+                    run_insert(&pool, &table_name, &mut rng, &id_counter, verbose).await
                 } else {
-                    run_update_mixed(&pool, &mut rng, &id_counter, verbose).await
+                    run_update_mixed(&pool, &table_name, &mut rng, &id_counter, verbose).await
                 };
 
                 match result {
@@ -131,7 +135,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("=== Summary ===");
     println!("Mode           : {}", args.mode);
-    println!("Writers        : {}", args.writers);
     println!("Elapsed        : {:.2?}", elapsed);
     println!("Total txns     : {}", txn_count);
     println!("Total rows     : {}", total_rows);
@@ -170,6 +173,7 @@ fn print_percentiles(name: &str, latencies: &mut Vec<u128>) {
 
 async fn run_insert(
     pool: &Pool<MySql>,
+    table_name: &str,
     rng: &mut impl Rng,
     id_counter: &AtomicU64,
     verbose: bool,
@@ -185,11 +189,14 @@ async fn run_insert(
     let langs: i32 = rng.gen_range(1..10);
     let vector = generate_vector_string(rng);
 
-    let sql = r#"
-        INSERT INTO wiki_paragraphs_embeddings
+    let sql = format!(
+        r#"
+        INSERT INTO `{table}`
             (id, wiki_id, paragraph_id, title, text, url, views, langs, vector)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    "#;
+    "#,
+        table = table_name
+    );
 
     if verbose {
         println!("INSERT id={}", id);
@@ -213,6 +220,7 @@ async fn run_insert(
 
 async fn run_update_mixed(
     pool: &Pool<MySql>,
+    table_name: &str,
     rng: &mut impl Rng,
     id_counter: &AtomicU64,
     verbose: bool,
@@ -220,7 +228,7 @@ async fn run_update_mixed(
     let current_max = id_counter.load(Ordering::Relaxed);
     // If there is no data yet, fall back to insert
     if current_max <= 1 || rng.gen_bool(0.5) {
-        return run_insert(pool, rng, id_counter, verbose).await;
+        return run_insert(pool, table_name, rng, id_counter, verbose).await;
     }
 
     let target_id = rng.gen_range(1..current_max) as i64;
@@ -228,11 +236,14 @@ async fn run_update_mixed(
     let new_text = generate_text(rng, 256);
     let new_vector = generate_vector_string(rng);
 
-    let sql = r#"
-        UPDATE wiki_paragraphs_embeddings
+    let sql = format!(
+        r#"
+        UPDATE `{table}`
         SET views = COALESCE(views, 0) + ?, text = ?, vector = ?
         WHERE id = ?
-    "#;
+    "#,
+        table = table_name
+    );
 
     if verbose {
         println!("UPDATE id={}", target_id);
@@ -272,4 +283,48 @@ fn generate_vector_string(rng: &mut impl Rng) -> String {
     }
     out
 }
+
+/// Create a new table with timestamp suffix and add FULLTEXT index on (title, text).
+async fn create_table_with_index(pool: &Pool<MySql>) -> Result<String, sqlx::Error> {
+    let ts = Local::now().format("%Y%m%d%H%M%S").to_string();
+    let table_name = format!("wiki_paragraphs_embeddings_{}", ts);
+
+    let create_sql = format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS `{table}` (
+          id            BIGINT       NOT NULL,
+          wiki_id       BIGINT       NOT NULL,
+          paragraph_id  INT          NOT NULL,
+          title         VARCHAR(512) NOT NULL,
+          text          TEXT         NOT NULL,
+          url           VARCHAR(512) NOT NULL,
+          views         DOUBLE       NULL,
+          langs         INT          NULL,
+          vector        TEXT         NOT NULL,
+          PRIMARY KEY (id),
+          KEY idx_wiki_para (wiki_id, paragraph_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        "#,
+        table = table_name
+    );
+
+    let alter_sql = format!(
+        r#"
+        ALTER TABLE `{table}`
+          ADD FULLTEXT INDEX ft_index (title, text) WITH PARSER standard;
+        "#,
+        table = table_name
+    );
+
+    // Create table
+    sqlx::query(&create_sql).execute(pool).await?;
+
+    // Try to add FULLTEXT index; ignore error if it already exists
+    if let Err(e) = sqlx::query(&alter_sql).execute(pool).await {
+        eprintln!("warning: failed to add FULLTEXT index: {}", e);
+    }
+
+    Ok(table_name)
+}
+
 
