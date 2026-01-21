@@ -36,6 +36,10 @@ struct Args {
     /// Enable verbose logging (print individual SQLs)
     #[arg(long, default_value_t = false)]
     verbose: bool,
+
+    /// Use randomly generated in-memory samples instead of parquet data
+    #[arg(long, default_value_t = false)]
+    use_random_data: bool,
 }
 
 struct ThreadStats {
@@ -76,10 +80,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     println!("--- TiDB wiki_paragraphs_embeddings OLTP benchmark ---");
-    println!("mode        : {}", args.mode);
-    println!("concurrency : {}", args.concurrency);
-    println!("duration    : {}s", args.duration);
-    println!("build_index : {}", args.build_index);
+    println!("mode           : {}", args.mode);
+    println!("concurrency    : {}", args.concurrency);
+    println!("duration       : {}s", args.duration);
+    println!("build_index    : {}", args.build_index);
+    println!("use_random_data: {}", args.use_random_data);
 
     // Global TiDB connection settings
     // Equivalent to: mysql --comments --host 127.0.0.1 --port 4000 -u root test
@@ -95,9 +100,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect_with(opts)
         .await?;
 
-    // Ensure local data samples exist (download from HF when missing) and load them.
-    let samples = Arc::new(ensure_samples()?);
-    println!("loaded {} samples from ./data", samples.len());
+    // Ensure local data samples exist (download from HF when missing) and load them,
+    // or generate random samples in memory when requested.
+    let samples = if args.use_random_data {
+        let generated = generate_random_samples(200_000);
+        println!("generated {} random samples in memory", generated.len());
+        Arc::new(generated)
+    } else {
+        let loaded = ensure_samples()?;
+        println!("loaded {} samples from ./data", loaded.len());
+        Arc::new(loaded)
+    };
 
     // Create table with timestamp suffix and optional FULLTEXT index automatically
     let table_name = Arc::new(create_table_with_index(&pool, args.build_index).await?);
@@ -338,6 +351,20 @@ fn generate_vector_string(rng: &mut impl Rng) -> String {
         out.push_str(&format!("{:.6}", v));
     }
     out
+}
+
+fn generate_random_samples(count: usize) -> Vec<SampleRow> {
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut samples = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let title = generate_text(&mut rng, 32);
+        let text = generate_text(&mut rng, 256);
+        let vector = generate_vector_string(&mut rng);
+        samples.push(SampleRow { title, text, vector });
+    }
+
+    samples
 }
 
 /// Create a new table with timestamp suffix and optionally add FULLTEXT index on (title, text).

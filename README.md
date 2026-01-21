@@ -26,13 +26,17 @@ The benchmark connects to TiDB using the following fixed settings:
 - user: `root`
 - database: `test`
 
-On startup it will:
+On startup it will (by default):
 
 - download the `maloyan/wikipedia-22-12-en-embeddings-all-MiniLM-L6-v2` dataset
-  from Hugging Face (if `./data/samples.csv` does not exist yet), and generate
-  `./data/samples.csv` with sampled `title/text/vector` rows;
+  from Hugging Face (if there are no parquet files under `./data/raw` yet),
+  and materialize multiple parquet shards under `./data/raw`;
+- load sampled `title/text/vector` rows from these parquet files into memory;
 - create a table named `wiki_paragraphs_embeddings_YYYYMMDDHHMMSS`;
 - optionally add a FULLTEXT index on `(title, text)` if `--build-index true`.
+
+Alternatively, you can skip the dataset download and use randomly generated
+in-memory samples by passing `--use-random-data true`.
 
 ```bash
 # Insert-only workload with FULLTEXT index
