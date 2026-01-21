@@ -28,6 +28,10 @@ struct Args {
     #[arg(short, long, default_value_t = 60)]
     duration: u64,
 
+    /// Whether to create FULLTEXT index on (title, text)
+    #[arg(long, default_value_t = true)]
+    build_index: bool,
+
     /// Enable verbose logging (print individual SQLs)
     #[arg(long, default_value_t = false)]
     verbose: bool,
@@ -64,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("mode        : {}", args.mode);
     println!("concurrency : {}", args.concurrency);
     println!("duration    : {}s", args.duration);
+    println!("build_index : {}", args.build_index);
 
     // Global TiDB connection settings
     // Equivalent to: mysql --comments --host 127.0.0.1 --port 4000 -u root test
@@ -83,8 +88,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let samples = Arc::new(ensure_samples()?);
     println!("loaded {} samples from ./data", samples.len());
 
-    // Create table with timestamp suffix and FULLTEXT index automatically
-    let table_name = Arc::new(create_table_with_index(&pool).await?);
+    // Create table with timestamp suffix and optional FULLTEXT index automatically
+    let table_name = Arc::new(create_table_with_index(&pool, args.build_index).await?);
     println!("using table: {}", table_name);
 
     let id_counter = Arc::new(AtomicU64::new(1));
@@ -303,8 +308,8 @@ fn generate_vector_string(rng: &mut impl Rng) -> String {
     out
 }
 
-/// Create a new table with timestamp suffix and add FULLTEXT index on (title, text).
-async fn create_table_with_index(pool: &Pool<MySql>) -> Result<String, sqlx::Error> {
+/// Create a new table with timestamp suffix and optionally add FULLTEXT index on (title, text).
+async fn create_table_with_index(pool: &Pool<MySql>, build_index: bool) -> Result<String, sqlx::Error> {
     let ts = Local::now().format("%Y%m%d%H%M%S").to_string();
     let table_name = format!("wiki_paragraphs_embeddings_{}", ts);
 
@@ -327,20 +332,22 @@ async fn create_table_with_index(pool: &Pool<MySql>) -> Result<String, sqlx::Err
         table = table_name
     );
 
-    let alter_sql = format!(
-        r#"
-        ALTER TABLE `{table}`
-          ADD FULLTEXT INDEX ft_index (title, text) WITH PARSER standard;
-        "#,
-        table = table_name
-    );
-
     // Create table
     sqlx::query(&create_sql).execute(pool).await?;
 
-    // Try to add FULLTEXT index; ignore error if it already exists
-    if let Err(e) = sqlx::query(&alter_sql).execute(pool).await {
-        eprintln!("warning: failed to add FULLTEXT index: {}", e);
+    if build_index {
+        let alter_sql = format!(
+            r#"
+            ALTER TABLE `{table}`
+              ADD FULLTEXT INDEX ft_index (title, text) WITH PARSER standard;
+            "#,
+            table = table_name
+        );
+
+        // Try to add FULLTEXT index; ignore error if it already exists
+        if let Err(e) = sqlx::query(&alter_sql).execute(pool).await {
+            eprintln!("warning: failed to add FULLTEXT index: {}", e);
+        }
     }
 
     Ok(table_name)

@@ -26,20 +26,26 @@ The benchmark connects to TiDB using the following fixed settings:
 - user: `root`
 - database: `test`
 
-On startup it will automatically create a table named
-`wiki_paragraphs_embeddings_YYYYMMDDHHMMSS` and add a FULLTEXT index on
-`(title, text)`.
+On startup it will:
+
+- download the `maloyan/wikipedia-22-12-en-embeddings-all-MiniLM-L6-v2` dataset
+  from Hugging Face (if `./data/samples.csv` does not exist yet), and generate
+  `./data/samples.csv` with sampled `title/text/vector` rows;
+- create a table named `wiki_paragraphs_embeddings_YYYYMMDDHHMMSS`;
+- optionally add a FULLTEXT index on `(title, text)` if `--build-index true`.
 
 ```bash
-# Insert-only workload
+# Insert-only workload with FULLTEXT index
 ./target/release/wiki-vec-bench \
   --mode insert-only \
   --concurrency 16 \
-  --duration 60
+  --duration 60 \
+  --build-index true
 
-# Update-mixed workload
+# Update-mixed workload without FULLTEXT index
 ./target/release/wiki-vec-bench \
   --mode update-mixed \
   --concurrency 16 \
-  --duration 60
+  --duration 60 \
+  --build-index false
 ```
