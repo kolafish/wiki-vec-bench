@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
-Download the Wikipedia embeddings dataset from Hugging Face and
-materialize:
-
-- Full dataset as parquet shards under ./data/raw
-- A smaller sampled CSV at ./data/samples.csv with columns:
-  title,text,vector
+Download half of the Wikipedia embeddings dataset from Hugging Face and
+materialize it as parquet under ./data/raw.
 """
 
 from pathlib import Path
@@ -15,8 +11,8 @@ from datasets import load_dataset
 
 
 DATASET_NAME = "maloyan/wikipedia-22-12-en-embeddings-all-MiniLM-L6-v2"
-SPLIT = "train"
-SAMPLE_LIMIT = 200_000  # number of rows to keep in samples.csv
+# Only load 50% of the train split to reduce download size.
+SPLIT = "train[:50%]"
 
 
 def main() -> None:
