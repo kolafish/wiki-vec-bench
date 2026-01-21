@@ -207,12 +207,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_inserts, insert_pct, total_updates, update_pct
     );
 
-    print_percentiles("write", &mut all_lat);
+    print_percentiles("write", &mut all_lat, tps);
 
     Ok(())
 }
 
-fn print_percentiles(name: &str, latencies: &mut Vec<u128>) {
+fn print_percentiles(name: &str, latencies: &mut Vec<u128>, qps: f64) {
     if latencies.is_empty() {
         println!("{}: no samples", name);
         return;
@@ -226,9 +226,9 @@ fn print_percentiles(name: &str, latencies: &mut Vec<u128>) {
 
     let to_ms = |us: u128| us as f64 / 1000.0;
     println!(
-        "{:<10} count={} p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms",
+        "{:<10} qps={:.2} p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms",
         name,
-        latencies.len(),
+        qps,
         to_ms(p50),
         to_ms(p95),
         to_ms(p99),
