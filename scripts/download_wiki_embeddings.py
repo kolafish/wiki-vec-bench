@@ -32,7 +32,10 @@ def main() -> None:
     ds = load_dataset(DATASET_NAME, split=SPLIT)
 
     print(f"Saving full dataset to parquet under {raw_dir} ...", flush=True)
-    ds.to_parquet(str(raw_dir))
+    # Write a single parquet file; the Rust benchmark will read all *.parquet
+    # files under ./data/raw, so one big file is fine here.
+    output_path = raw_dir / "wikipedia_embeddings.parquet"
+    ds.to_parquet(str(output_path))
 
     print("Download finished. Parquet shards are stored under ./data/raw.", flush=True)
 
