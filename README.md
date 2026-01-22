@@ -107,16 +107,17 @@ The read benchmark compares query performance across three execution engines:
 
 The benchmark runs in sequential phases, each for the specified duration:
 
-**Simple Queries Mode** (default):
-1. **Phase 1**: TiDB queries using `fts_match_word()`
-2. **Phase 2**: TiKV queries using `LIKE` with row storage
-3. **Phase 3**: TiFlash queries using `LIKE` with columnar storage
+**Simple Queries Mode** (default, without `--complex-queries`):
+1. **Phase 1**: TiDB simple queries using `fts_match_word()`
+2. **Phase 2**: TiKV simple queries using `LIKE` with row storage
+3. **Phase 3**: TiFlash simple queries using `LIKE` with columnar storage
 
 **Complex Queries Mode** (with `--complex-queries` flag):
-- Phases 1-3: Simple queries (as above)
-- **Phase 4**: TiDB complex queries
-- **Phase 5**: TiKV complex queries
-- **Phase 6**: TiFlash complex queries
+1. **Phase 1**: TiDB complex queries
+2. **Phase 2**: TiKV complex queries
+3. **Phase 3**: TiFlash complex queries
+
+**Important**: When `--complex-queries` is specified, ONLY complex queries are executed. Simple queries are skipped to save time and focus on analytical workload performance.
 
 ### Complex Query Types
 

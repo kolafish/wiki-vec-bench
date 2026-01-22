@@ -809,82 +809,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logger = Arc::new(QueryLogger::new(&args.output_file, &table_name)?);
     let executor = Arc::new(QueryExecutor::new(pool.clone(), table_name.clone(), logger.clone()));
     let sample_data = Arc::new(sample_data);
-
-    // Phase 1: Benchmark TiDB
-    println!("=== Phase 1: Benchmarking TiDB ===");
-    let tidb_start = Instant::now();
     let duration = Duration::from_secs(args.duration);
-    let mut tidb_handles = Vec::with_capacity(args.concurrency);
 
-    for _ in 0..args.concurrency {
-        let executor = executor.clone();
-        let sample_data = sample_data.clone();
-        let verbose = args.verbose;
+    // Simple queries benchmark (if complex queries not enabled)
+    let (tidb_elapsed, tikv_elapsed, tiflash_elapsed, mut tidb_stats, mut tikv_stats, mut tiflash_stats) = if !args.complex_queries {
+        println!("\n========================================");
+        println!("=== SIMPLE QUERIES BENCHMARK ===");
+        println!("========================================\n");
 
-        let handle = tokio::spawn(async move {
-            run_benchmark_worker(executor, sample_data, tidb_start, duration, QueryEngine::TiDB, verbose).await
-        });
+        // Phase 1: Benchmark TiDB
+        println!("=== Phase 1: Benchmarking TiDB (Simple Queries) ===");
+        let tidb_start = Instant::now();
+        let mut tidb_handles = Vec::with_capacity(args.concurrency);
 
-        tidb_handles.push(handle);
-    }
+        for _ in 0..args.concurrency {
+            let executor = executor.clone();
+            let sample_data = sample_data.clone();
+            let verbose = args.verbose;
 
-    // Collect TiDB results
-    let mut tidb_stats = ThreadStats::new();
-    for handle in tidb_handles {
-        tidb_stats.merge(handle.await?);
-    }
-    let tidb_elapsed = tidb_start.elapsed();
-    println!("✓ TiDB benchmark completed in {:.2?}\n", tidb_elapsed);
+            let handle = tokio::spawn(async move {
+                run_benchmark_worker(executor, sample_data, tidb_start, duration, QueryEngine::TiDB, verbose).await
+            });
 
-    // Phase 2: Benchmark TiKV
-    println!("=== Phase 2: Benchmarking TiKV ===");
-    let tikv_start = Instant::now();
-    let mut tikv_handles = Vec::with_capacity(args.concurrency);
+            tidb_handles.push(handle);
+        }
 
-    for _ in 0..args.concurrency {
-        let executor = executor.clone();
-        let sample_data = sample_data.clone();
-        let verbose = args.verbose;
+        let mut tidb_stats = ThreadStats::new();
+        for handle in tidb_handles {
+            tidb_stats.merge(handle.await?);
+        }
+        let tidb_elapsed = tidb_start.elapsed();
+        println!("✓ TiDB simple queries completed in {:.2?}\n", tidb_elapsed);
 
-        let handle = tokio::spawn(async move {
-            run_benchmark_worker(executor, sample_data, tikv_start, duration, QueryEngine::TiKV, verbose).await
-        });
+        // Phase 2: Benchmark TiKV
+        println!("=== Phase 2: Benchmarking TiKV (Simple Queries) ===");
+        let tikv_start = Instant::now();
+        let mut tikv_handles = Vec::with_capacity(args.concurrency);
 
-        tikv_handles.push(handle);
-    }
+        for _ in 0..args.concurrency {
+            let executor = executor.clone();
+            let sample_data = sample_data.clone();
+            let verbose = args.verbose;
 
-    // Collect TiKV results
-    let mut tikv_stats = ThreadStats::new();
-    for handle in tikv_handles {
-        tikv_stats.merge(handle.await?);
-    }
-    let tikv_elapsed = tikv_start.elapsed();
-    println!("✓ TiKV benchmark completed in {:.2?}\n", tikv_elapsed);
+            let handle = tokio::spawn(async move {
+                run_benchmark_worker(executor, sample_data, tikv_start, duration, QueryEngine::TiKV, verbose).await
+            });
 
-    // Phase 3: Benchmark TiFlash
-    println!("=== Phase 3: Benchmarking TiFlash ===");
-    let tiflash_start = Instant::now();
-    let mut tiflash_handles = Vec::with_capacity(args.concurrency);
+            tikv_handles.push(handle);
+        }
 
-    for _ in 0..args.concurrency {
-        let executor = executor.clone();
-        let sample_data = sample_data.clone();
-        let verbose = args.verbose;
+        let mut tikv_stats = ThreadStats::new();
+        for handle in tikv_handles {
+            tikv_stats.merge(handle.await?);
+        }
+        let tikv_elapsed = tikv_start.elapsed();
+        println!("✓ TiKV simple queries completed in {:.2?}\n", tikv_elapsed);
 
-        let handle = tokio::spawn(async move {
-            run_benchmark_worker(executor, sample_data, tiflash_start, duration, QueryEngine::TiFlash, verbose).await
-        });
+        // Phase 3: Benchmark TiFlash
+        println!("=== Phase 3: Benchmarking TiFlash (Simple Queries) ===");
+        let tiflash_start = Instant::now();
+        let mut tiflash_handles = Vec::with_capacity(args.concurrency);
 
-        tiflash_handles.push(handle);
-    }
+        for _ in 0..args.concurrency {
+            let executor = executor.clone();
+            let sample_data = sample_data.clone();
+            let verbose = args.verbose;
 
-    // Collect TiFlash results
-    let mut tiflash_stats = ThreadStats::new();
-    for handle in tiflash_handles {
-        tiflash_stats.merge(handle.await?);
-    }
-    let tiflash_elapsed = tiflash_start.elapsed();
-    println!("✓ TiFlash benchmark completed in {:.2?}\n", tiflash_elapsed);
+            let handle = tokio::spawn(async move {
+                run_benchmark_worker(executor, sample_data, tiflash_start, duration, QueryEngine::TiFlash, verbose).await
+            });
+
+            tiflash_handles.push(handle);
+        }
+
+        let mut tiflash_stats = ThreadStats::new();
+        for handle in tiflash_handles {
+            tiflash_stats.merge(handle.await?);
+        }
+        let tiflash_elapsed = tiflash_start.elapsed();
+        println!("✓ TiFlash simple queries completed in {:.2?}\n", tiflash_elapsed);
+
+        (tidb_elapsed, tikv_elapsed, tiflash_elapsed, tidb_stats, tikv_stats, tiflash_stats)
+    } else {
+        (Duration::ZERO, Duration::ZERO, Duration::ZERO, ThreadStats::new(), ThreadStats::new(), ThreadStats::new())
+    };
 
     // Complex queries benchmark (if enabled)
     let (tidb_complex_elapsed, tikv_complex_elapsed, tiflash_complex_elapsed) = if args.complex_queries {
@@ -892,8 +900,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("=== COMPLEX QUERIES BENCHMARK ===");
         println!("========================================\n");
 
-        // Phase 4: Complex TiDB queries
-        println!("=== Phase 4: Benchmarking TiDB (Complex Queries) ===");
+        // Phase 1: Complex TiDB queries
+        println!("=== Phase 1: Benchmarking TiDB (Complex Queries) ===");
         let tidb_complex_start = Instant::now();
         let mut tidb_complex_handles = Vec::with_capacity(args.concurrency);
 
@@ -916,8 +924,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tidb_complex_elapsed = tidb_complex_start.elapsed();
         println!("✓ TiDB complex queries completed in {:.2?}\n", tidb_complex_elapsed);
 
-        // Phase 5: Complex TiKV queries
-        println!("=== Phase 5: Benchmarking TiKV (Complex Queries) ===");
+        // Phase 2: Complex TiKV queries
+        println!("=== Phase 2: Benchmarking TiKV (Complex Queries) ===");
         let tikv_complex_start = Instant::now();
         let mut tikv_complex_handles = Vec::with_capacity(args.concurrency);
 
@@ -940,8 +948,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tikv_complex_elapsed = tikv_complex_start.elapsed();
         println!("✓ TiKV complex queries completed in {:.2?}\n", tikv_complex_elapsed);
 
-        // Phase 6: Complex TiFlash queries
-        println!("=== Phase 6: Benchmarking TiFlash (Complex Queries) ===");
+        // Phase 3: Complex TiFlash queries
+        println!("=== Phase 3: Benchmarking TiFlash (Complex Queries) ===");
         let tiflash_complex_start = Instant::now();
         let mut tiflash_complex_handles = Vec::with_capacity(args.concurrency);
 
@@ -983,47 +991,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     combined_stats.tiflash_complex_latencies = tiflash_stats.tiflash_complex_latencies;
     combined_stats.errors = tidb_stats.errors + tikv_stats.errors + tiflash_stats.errors;
 
-    let total_elapsed = tidb_elapsed + tikv_elapsed + tiflash_elapsed;
-
     // Print results
     println!("\n=== Summary ===");
-    println!("TiDB elapsed   : {:.2?}", tidb_elapsed);
-    println!("TiKV elapsed   : {:.2?}", tikv_elapsed);
-    println!("TiFlash elapsed: {:.2?}", tiflash_elapsed);
-    println!("Total elapsed  : {:.2?}", total_elapsed);
-    println!("Total errors   : {}\n", combined_stats.errors);
+    
+    if !args.complex_queries {
+        // Simple queries summary
+        let total_elapsed = tidb_elapsed + tikv_elapsed + tiflash_elapsed;
+        println!("Query Type     : Simple");
+        println!("TiDB elapsed   : {:.2?}", tidb_elapsed);
+        println!("TiKV elapsed   : {:.2?}", tikv_elapsed);
+        println!("TiFlash elapsed: {:.2?}", tiflash_elapsed);
+        println!("Total elapsed  : {:.2?}", total_elapsed);
+        println!("Total errors   : {}\n", combined_stats.errors);
 
-    println!("--- Simple Queries ---");
-    print_statistics("TiDB", &mut combined_stats.tidb_latencies, tidb_elapsed);
-    println!();
-    print_statistics("TiKV", &mut combined_stats.tikv_latencies, tikv_elapsed);
-    println!();
-    print_statistics("TiFlash", &mut combined_stats.tiflash_latencies, tiflash_elapsed);
-
-    // Print comparison
-    if !combined_stats.tidb_latencies.is_empty() 
-        && !combined_stats.tikv_latencies.is_empty() 
-        && !combined_stats.tiflash_latencies.is_empty() {
-        let tidb_qps = combined_stats.tidb_latencies.len() as f64 / tidb_elapsed.as_secs_f64();
-        let tikv_qps = combined_stats.tikv_latencies.len() as f64 / tikv_elapsed.as_secs_f64();
-        let tiflash_qps = combined_stats.tiflash_latencies.len() as f64 / tiflash_elapsed.as_secs_f64();
-        println!("\n--- Simple Query Comparison ---");
-        println!("TiDB   QPS: {:.2}", tidb_qps);
-        println!("TiKV   QPS: {:.2}", tikv_qps);
-        println!("TiFlash QPS: {:.2}", tiflash_qps);
-        println!("QPS ratio (TiKV/TiDB): {:.2}x", tikv_qps / tidb_qps);
-        println!("QPS ratio (TiFlash/TiDB): {:.2}x", tiflash_qps / tidb_qps);
-        println!("QPS ratio (TiFlash/TiKV): {:.2}x", tiflash_qps / tikv_qps);
-    }
-
-    // Print complex query statistics if enabled
-    if args.complex_queries {
-        println!("\n--- Complex Queries ---");
-        print_statistics("TiDB (Complex)", &mut combined_stats.tidb_complex_latencies, tidb_complex_elapsed);
+        println!("--- Query Statistics ---");
+        print_statistics("TiDB", &mut combined_stats.tidb_latencies, tidb_elapsed);
         println!();
-        print_statistics("TiKV (Complex)", &mut combined_stats.tikv_complex_latencies, tikv_complex_elapsed);
+        print_statistics("TiKV", &mut combined_stats.tikv_latencies, tikv_elapsed);
         println!();
-        print_statistics("TiFlash (Complex)", &mut combined_stats.tiflash_complex_latencies, tiflash_complex_elapsed);
+        print_statistics("TiFlash", &mut combined_stats.tiflash_latencies, tiflash_elapsed);
+
+        // Print comparison
+        if !combined_stats.tidb_latencies.is_empty() 
+            && !combined_stats.tikv_latencies.is_empty() 
+            && !combined_stats.tiflash_latencies.is_empty() {
+            let tidb_qps = combined_stats.tidb_latencies.len() as f64 / tidb_elapsed.as_secs_f64();
+            let tikv_qps = combined_stats.tikv_latencies.len() as f64 / tikv_elapsed.as_secs_f64();
+            let tiflash_qps = combined_stats.tiflash_latencies.len() as f64 / tiflash_elapsed.as_secs_f64();
+            println!("\n--- Performance Comparison ---");
+            println!("TiDB   QPS: {:.2}", tidb_qps);
+            println!("TiKV   QPS: {:.2}", tikv_qps);
+            println!("TiFlash QPS: {:.2}", tiflash_qps);
+            println!("QPS ratio (TiKV/TiDB): {:.2}x", tikv_qps / tidb_qps);
+            println!("QPS ratio (TiFlash/TiDB): {:.2}x", tiflash_qps / tidb_qps);
+            println!("QPS ratio (TiFlash/TiKV): {:.2}x", tiflash_qps / tikv_qps);
+        }
+    } else {
+        // Complex queries summary
+        let total_elapsed = tidb_complex_elapsed + tikv_complex_elapsed + tiflash_complex_elapsed;
+        println!("Query Type     : Complex");
+        println!("TiDB elapsed   : {:.2?}", tidb_complex_elapsed);
+        println!("TiKV elapsed   : {:.2?}", tikv_complex_elapsed);
+        println!("TiFlash elapsed: {:.2?}", tiflash_complex_elapsed);
+        println!("Total elapsed  : {:.2?}", total_elapsed);
+        println!("Total errors   : {}\n", combined_stats.errors);
+
+        println!("--- Query Statistics ---");
+        print_statistics("TiDB", &mut combined_stats.tidb_complex_latencies, tidb_complex_elapsed);
+        println!();
+        print_statistics("TiKV", &mut combined_stats.tikv_complex_latencies, tikv_complex_elapsed);
+        println!();
+        print_statistics("TiFlash", &mut combined_stats.tiflash_complex_latencies, tiflash_complex_elapsed);
 
         if !combined_stats.tidb_complex_latencies.is_empty() 
             && !combined_stats.tikv_complex_latencies.is_empty() 
@@ -1031,10 +1049,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tidb_complex_qps = combined_stats.tidb_complex_latencies.len() as f64 / tidb_complex_elapsed.as_secs_f64();
             let tikv_complex_qps = combined_stats.tikv_complex_latencies.len() as f64 / tikv_complex_elapsed.as_secs_f64();
             let tiflash_complex_qps = combined_stats.tiflash_complex_latencies.len() as f64 / tiflash_complex_elapsed.as_secs_f64();
-            println!("\n--- Complex Query Comparison ---");
-            println!("TiDB (Complex)   QPS: {:.2}", tidb_complex_qps);
-            println!("TiKV (Complex)   QPS: {:.2}", tikv_complex_qps);
-            println!("TiFlash (Complex) QPS: {:.2}", tiflash_complex_qps);
+            println!("\n--- Performance Comparison ---");
+            println!("TiDB   QPS: {:.2}", tidb_complex_qps);
+            println!("TiKV   QPS: {:.2}", tikv_complex_qps);
+            println!("TiFlash QPS: {:.2}", tiflash_complex_qps);
             println!("QPS ratio (TiKV/TiDB): {:.2}x", tikv_complex_qps / tidb_complex_qps);
             println!("QPS ratio (TiFlash/TiDB): {:.2}x", tiflash_complex_qps / tidb_complex_qps);
             println!("QPS ratio (TiFlash/TiKV): {:.2}x", tiflash_complex_qps / tikv_complex_qps);
