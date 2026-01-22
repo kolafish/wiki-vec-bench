@@ -1,6 +1,9 @@
 # wiki-vec-bench
 
-Rust benchmark tool for running write workloads (e.g. insert-only / update-mixed) against a MySQL-compatible endpoint.
+Rust benchmark tool for running write and read workloads against a MySQL-compatible endpoint (e.g., TiDB).
+
+- `wiki-vec-bench`: Write workload benchmark (insert-only / update-mixed)
+- `read-bench`: Read workload benchmark using `fts_match_word` queries, comparing TiDB vs TiFlash performance
 
 ## Prerequisites
 
@@ -69,3 +72,33 @@ in-memory samples by passing `--use-random-data true`.
   --build-index \
   --use-random-data
 ```
+
+## Read Benchmark (read-bench)
+
+The read benchmark tests query performance using `fts_match_word` function, comparing TiDB and TiFlash execution engines.
+
+It will:
+- Automatically find the table with the latest timestamp (matching `wiki_paragraphs_embeddings_*`)
+- Sample test data (title, text) from the table
+- Run queries using `fts_match_word` on both TiDB and TiFlash
+- Output performance statistics including QPS, p50, p95, p99 latencies
+
+```bash
+# Run read benchmark with default settings
+./target/release/read-bench \
+  --concurrency 16 \
+  --duration 60 \
+  --sample-size 2000
+
+# Run with verbose logging (prints individual SQL queries)
+./target/release/read-bench \
+  --concurrency 16 \
+  --duration 60 \
+  --sample-size 2000 \
+  --verbose
+```
+
+The benchmark will output:
+- TiDB statistics (QPS, p50, p95, p99, max latency)
+- TiFlash statistics (QPS, p50, p95, p99, max latency)
+- Comparison ratio (TiFlash/TiDB QPS)
