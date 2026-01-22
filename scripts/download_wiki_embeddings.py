@@ -30,8 +30,8 @@ def main() -> None:
     print(f"Saving dataset shards to parquet under {raw_dir} ...", flush=True)
     # Write multiple parquet shards; the Rust benchmark will read all *.parquet
     # files under ./data/raw, so multiple files are fully supported.
-    output_prefix = raw_dir / "wikipedia_embeddings"
-    ds.to_parquet(str(output_prefix))
+    # Pass directory path directly to to_parquet to create shard files in the directory
+    ds.to_parquet(str(raw_dir), batch_size=10000)
 
     print("Download finished. Parquet shards are stored under ./data/raw.", flush=True)
 

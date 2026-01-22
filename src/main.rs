@@ -436,6 +436,23 @@ fn ensure_samples() -> Result<Vec<SampleRow>, Box<dyn Error>> {
         if !status.success() {
             return Err("python scripts/download_wiki_embeddings.py failed".into());
         }
+        // Re-check for parquet files after download
+        let parquet_files: Vec<_> = std::fs::read_dir(&raw_dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("parquet"))
+            .collect();
+        if parquet_files.is_empty() {
+            eprintln!("warning: Python script completed but no parquet files found in {:?}", raw_dir);
+            eprintln!("listing all files in {:?}:", raw_dir);
+            if let Ok(entries) = std::fs::read_dir(&raw_dir) {
+                for entry in entries.flatten() {
+                    eprintln!("  {:?}", entry.path());
+                }
+            }
+            return Err("no parquet files found after download".into());
+        }
+        println!("found {} parquet file(s) after download", parquet_files.len());
     }
 
     load_samples_from_parquet(&raw_dir, 200_000)
