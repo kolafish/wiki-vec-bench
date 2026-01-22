@@ -30,11 +30,21 @@ def main() -> None:
     print(f"Saving dataset shards to parquet under {raw_dir} ...", flush=True)
     # Write multiple parquet shards; the Rust benchmark will read all *.parquet
     # files under ./data/raw, so multiple files are fully supported.
-    # Use num_proc to create multiple shard files automatically.
-    # The path should be a file pattern, and datasets will create files like:
-    # wikipedia_embeddings-00000-of-00010.parquet, wikipedia_embeddings-00001-of-00010.parquet, etc.
-    output_path = raw_dir / "wikipedia_embeddings.parquet"
-    ds.to_parquet(str(output_path), num_proc=8, batch_size=10000)
+    # Manually split the dataset into multiple shards for better write performance.
+    num_shards = 8
+    total_size = len(ds)
+    shard_size = (total_size + num_shards - 1) // num_shards
+    
+    for i in range(num_shards):
+        start_idx = i * shard_size
+        end_idx = min((i + 1) * shard_size, total_size)
+        if start_idx >= total_size:
+            break
+        
+        shard = ds.select(range(start_idx, end_idx))
+        output_path = raw_dir / f"wikipedia_embeddings-{i:05d}-of-{num_shards:05d}.parquet"
+        print(f"Writing shard {i+1}/{num_shards} ({start_idx}-{end_idx}) to {output_path.name}...", flush=True)
+        shard.to_parquet(str(output_path), batch_size=10000)
 
     print("Download finished. Parquet shards are stored under ./data/raw.", flush=True)
 
