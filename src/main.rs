@@ -455,7 +455,22 @@ fn ensure_samples() -> Result<Vec<SampleRow>, Box<dyn Error>> {
         println!("found {} parquet file(s) after download", parquet_files.len());
     }
 
-    load_samples_from_parquet(&raw_dir, 200_000)
+    // Try to load samples; if all files are corrupted or no samples loaded, trigger re-download
+    match load_samples_from_parquet(&raw_dir, 200_000) {
+        Ok(samples) if !samples.is_empty() => Ok(samples),
+        Ok(_) | Err(_) => {
+            eprintln!("warning: failed to load valid samples, all parquet files may be corrupted");
+            eprintln!("triggering re-download...");
+            let status = Command::new("python3")
+                .arg("scripts/download_wiki_embeddings.py")
+                .status()?;
+            if !status.success() {
+                return Err("python scripts/download_wiki_embeddings.py failed during re-download".into());
+            }
+            // Try loading again after re-download
+            load_samples_from_parquet(&raw_dir, 200_000)
+        }
+    }
 }
 
 fn pick_sample<'a>(rng: &mut impl Rng, samples: &'a [SampleRow]) -> &'a SampleRow {
