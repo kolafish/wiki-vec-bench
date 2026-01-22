@@ -441,8 +441,13 @@ fn ensure_samples() -> Result<Vec<SampleRow>, Box<dyn Error>> {
         Ok(samples) if !samples.is_empty() => {
             Ok(samples)
         },
-        Ok(_) | Err(e) => {
-            eprintln!("warning: failed to load samples from existing parquet files: {:?}", e);
+        result => {
+            // Either Ok with empty samples or Err
+            if let Err(ref e) = result {
+                eprintln!("warning: failed to load samples from existing parquet files: {:?}", e);
+            } else {
+                eprintln!("warning: loaded empty samples from existing parquet files");
+            }
             eprintln!("checking and re-downloading missing or corrupted shards...");
             
             // Run the download script, which will intelligently check existing files
