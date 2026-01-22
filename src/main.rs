@@ -388,7 +388,7 @@ async fn create_table_with_index(pool: &Pool<MySql>, build_index: bool) -> Resul
           views         DOUBLE       NULL,
           langs         INT          NULL,
           vector        TEXT         NOT NULL,
-          PRIMARY KEY (id, wiki_id),
+          PRIMARY KEY (id, wiki_id,views, langs),
           KEY idx_wiki_para (wiki_id, paragraph_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         "#,
