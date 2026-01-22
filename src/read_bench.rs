@@ -1,3 +1,49 @@
+//! TiDB Read Benchmark - Comparing TiDB vs TiFlash Performance
+//!
+//! ## How TiFlash Query Execution Works
+//!
+//! ### 1. TiFlash Architecture
+//! - **Columnar Storage**: TiFlash stores data in columnar format (vs TiKV's row format)
+//! - **MPP (Massively Parallel Processing)**: Queries are distributed across multiple TiFlash nodes
+//! - **Async Replication**: TiFlash replicates data from TiKV asynchronously
+//!
+//! ### 2. How We Ensure Queries Run on TiFlash
+//!
+//! **Method 1: SQL Hint (Current Implementation)**
+//! ```sql
+//! SELECT /*+ READ_FROM_STORAGE(TIFLASH[table_name]) */ ...
+//! ```
+//! - Forces TiDB optimizer to read from TiFlash replica
+//! - Requires: TiFlash replica exists AND engine isolation allows TiFlash
+//!
+//! **Method 2: Session Variable (Alternative)**
+//! ```sql
+//! SET SESSION tidb_isolation_read_engines = 'tiflash';
+//! ```
+//! - Forces all queries in the session to use TiFlash (if available)
+//!
+//! ### 3. Verification Steps
+//!
+//! 1. **Check Replica Exists**: Query `information_schema.tiflash_replica`
+//! 2. **Verify with EXPLAIN**: Check if `task` column shows `cop[tiflash]` or `batchCop[tiflash]`
+//! 3. **Check Engine Isolation**: Ensure `tidb_isolation_read_engines` includes 'tiflash'
+//!
+//! ### 4. When TiFlash Hint May Be Ignored
+//!
+//! - No TiFlash replica for the table
+//! - Engine isolation doesn't include TiFlash
+//! - Unsupported operations (some functions/operators)
+//! - Write operations (INSERT/UPDATE/DELETE)
+//!
+//! ### 5. TiFlash Query Execution Flow
+//!
+//! 1. TiDB receives query with hint
+//! 2. Optimizer checks if TiFlash replica exists
+//! 3. If yes, generates MPP plan and sends to TiFlash nodes
+//! 4. TiFlash nodes execute query in parallel (columnar processing)
+//! 5. Results are aggregated and returned to TiDB
+//! 6. TiDB returns final result to client
+
 use clap::Parser;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
@@ -78,6 +124,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     println!("using table: {}", table_name);
+
+    // Check if TiFlash replica exists and verify query execution
+    check_tiflash_replica(&pool, &table_name).await?;
+    verify_tiflash_query(&pool, &table_name).await?;
 
     // Sample test data from the table
     println!("> Sampling {} rows (title, text) from database...", args.sample_size);
@@ -288,10 +338,12 @@ async fn run_query_tiflash(
     verbose: bool,
 ) -> Result<Duration, sqlx::Error> {
     let start = Instant::now();
-    // Use TiFlash by SQL hint
+    // Use TiFlash by SQL hint: READ_FROM_STORAGE(TIFLASH[table])
+    // This hint forces TiDB optimizer to read from TiFlash replica
+    // TiFlash uses columnar storage and MPP (Massively Parallel Processing) architecture
     let query = format!(
         r#"
-        SELECT /*+ read_from_storage(tiflash[`{}`]) */ count(*) 
+        SELECT /*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */ count(*) 
         FROM `{}` 
         WHERE fts_match_word(title, ?) OR fts_match_word(text, ?)
         "#,
@@ -309,10 +361,110 @@ async fn run_query_tiflash(
     if verbose {
         println!("---------------------------------------------------");
         println!("[TiFlash] Time: {:?} | Count: {} | Word: '{}'", duration.as_millis(), count, search_word);
-        println!("SQL: SELECT /*+ read_from_storage(tiflash[`{}`]) */ count(*) FROM `{}` WHERE fts_match_word(title, '{}') OR fts_match_word(text, '{}');",
+        println!("SQL: SELECT /*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */ count(*) FROM `{}` WHERE fts_match_word(title, '{}') OR fts_match_word(text, '{}');",
             table_name, table_name, search_word, search_word
         );
     }
     
     Ok(duration)
+}
+
+/// Check if TiFlash replica exists for the table
+async fn check_tiflash_replica(pool: &Pool<MySql>, table_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let query = r#"
+        SELECT 
+            table_schema,
+            table_name,
+            is_tiflash_replica
+        FROM information_schema.tiflash_replica
+        WHERE table_schema = 'test' AND table_name = ?
+    "#;
+    
+    #[derive(sqlx::FromRow)]
+    struct ReplicaInfo {
+        table_schema: String,
+        table_name: String,
+        is_tiflash_replica: u8,
+    }
+    
+    let result: Option<ReplicaInfo> = sqlx::query_as(query)
+        .bind(table_name)
+        .fetch_optional(pool)
+        .await?;
+    
+    match result {
+        Some(info) => {
+            if info.is_tiflash_replica == 1 {
+                println!("✓ TiFlash replica exists for table: {}", table_name);
+            } else {
+                eprintln!("⚠ Warning: TiFlash replica not available for table: {}", table_name);
+                eprintln!("  Query hint may be ignored. Please create TiFlash replica first:");
+                eprintln!("  ALTER TABLE `{}` SET TIFLASH REPLICA 1;", table_name);
+            }
+        }
+        None => {
+            eprintln!("⚠ Warning: No TiFlash replica found for table: {}", table_name);
+            eprintln!("  Query hint may be ignored. Please create TiFlash replica first:");
+            eprintln!("  ALTER TABLE `{}` SET TIFLASH REPLICA 1;", table_name);
+        }
+    }
+    
+    Ok(())
+}
+
+/// Verify that query actually executes on TiFlash by checking EXPLAIN plan
+async fn verify_tiflash_query(pool: &Pool<MySql>, table_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // First, ensure TiFlash is in isolation read engines
+    sqlx::query("SET SESSION tidb_isolation_read_engines = 'tikv,tiflash'")
+        .execute(pool)
+        .await?;
+    
+    // Create a test query with hint
+    let explain_query = format!(
+        r#"
+        EXPLAIN SELECT /*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */ count(*) 
+        FROM `{}` 
+        WHERE fts_match_word(title, 'test') OR fts_match_word(text, 'test')
+        "#,
+        table_name, table_name
+    );
+    
+    #[derive(sqlx::FromRow)]
+    struct ExplainRow {
+        id: String,
+        est_rows: String,
+        task: String,
+        access_object: Option<String>,
+        operator_info: Option<String>,
+    }
+    
+    let rows: Vec<ExplainRow> = sqlx::query_as(&explain_query)
+        .fetch_all(pool)
+        .await?;
+    
+    let mut found_tiflash = false;
+    for row in &rows {
+        if row.task.contains("tiflash") || row.task.contains("batchCop[tiflash]") || row.task.contains("cop[tiflash]") {
+            found_tiflash = true;
+            println!("✓ Query plan verification: TiFlash will be used (task: {})", row.task);
+            break;
+        }
+    }
+    
+    if !found_tiflash {
+        eprintln!("⚠ Warning: EXPLAIN plan does not show TiFlash usage");
+        eprintln!("  This may mean:");
+        eprintln!("  1. TiFlash replica is not available");
+        eprintln!("  2. Query operations are not supported by TiFlash");
+        eprintln!("  3. Engine isolation settings prevent TiFlash usage");
+        eprintln!("  Plan details:");
+        for row in &rows {
+            println!("    task: {}, operator: {:?}", row.task, row.operator_info);
+        }
+    }
+    
+    // Note: Warnings from EXPLAIN are automatically shown in the query result
+    // If hint is ignored, TiDB will typically use TiKV instead
+    
+    Ok(())
 }
