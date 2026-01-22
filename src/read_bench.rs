@@ -9,6 +9,7 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use sqlx::mysql::{MySqlPoolOptions, MySqlConnectOptions};
 use sqlx::{Pool, MySql};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write, BufWriter};
 use std::sync::{Arc, Mutex};
@@ -150,6 +151,25 @@ struct SearchQuery {
     field: FieldType,
 }
 
+struct RareWordPool {
+    title_words: Vec<String>,
+    text_words: Vec<String>,
+}
+
+impl RareWordPool {
+    fn pick_word(&self, field: FieldType, rng: &mut impl Rng) -> Option<String> {
+        let pool = match field {
+            FieldType::Title => &self.title_words,
+            FieldType::Text => &self.text_words,
+        };
+        if pool.is_empty() {
+            None
+        } else {
+            Some(pool[rng.gen_range(0..pool.len())].clone())
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum QueryType {
     Simple,
@@ -259,64 +279,42 @@ impl QueryBuilder {
     ) -> String {
         let escaped_word = Self::escape_sql_string(search_word);
         let field_name = field.name();
-        
         let storage_hint = match engine {
             QueryEngine::TiDB => String::new(),
             QueryEngine::TiKV => format!("/*+ READ_FROM_STORAGE(TIKV[`{}`]) */", self.table_name),
             QueryEngine::TiFlash => format!("/*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */", self.table_name),
         };
+        let storage_prefix = if storage_hint.is_empty() {
+            String::new()
+        } else {
+            format!("{} ", storage_hint)
+        };
+        let match_predicate = match engine {
+            QueryEngine::TiDB => format!("fts_match_word('{}', {})", escaped_word, field_name),
+            _ => format!("{} LIKE '%{}%'", field_name, escaped_word),
+        };
         
         match variant {
             ComplexQueryVariant::WithMetadataFilter => {
-                // Filter by metadata: search + views > 1000 + langs >= 2
-                match engine {
-                    QueryEngine::TiDB => {
-                        format!(
-                            "SELECT count(*) FROM `{}` WHERE fts_match_word('{}', {}) AND views > 1000 AND langs >= 2",
-                            self.table_name, escaped_word, field_name
-                        )
-                    }
-                    _ => {
-                        format!(
-                            "SELECT {} count(*) FROM `{}` WHERE {} LIKE '%{}%' AND views > 1000 AND langs >= 2",
-                            storage_hint, self.table_name, field_name, escaped_word
-                        )
-                    }
-                }
+                // Filter by metadata while keeping aggregation on PK
+                format!(
+                    "SELECT {}COUNT(id) FROM `{}` WHERE {} AND views > 1000 AND langs >= 2",
+                    storage_prefix, self.table_name, match_predicate
+                )
             }
             ComplexQueryVariant::GroupByLangs => {
-                // GROUP BY langs with count aggregation
-                match engine {
-                    QueryEngine::TiDB => {
-                        format!(
-                            "SELECT langs, count(*) as cnt FROM `{}` WHERE fts_match_word('{}', {}) GROUP BY langs ORDER BY cnt DESC LIMIT 10",
-                            self.table_name, escaped_word, field_name
-                        )
-                    }
-                    _ => {
-                        format!(
-                            "SELECT {} langs, count(*) as cnt FROM `{}` WHERE {} LIKE '%{}%' GROUP BY langs ORDER BY cnt DESC LIMIT 10",
-                            storage_hint, self.table_name, field_name, escaped_word
-                        )
-                    }
-                }
+                // GROUP BY langs with PK-based aggregation
+                format!(
+                    "SELECT {} langs, COUNT(id) as cnt FROM `{}` WHERE {} GROUP BY langs ORDER BY cnt DESC LIMIT 10",
+                    storage_prefix, self.table_name, match_predicate
+                )
             }
             ComplexQueryVariant::TopNByViews => {
-                // TOP-N query ordered by views
-                match engine {
-                    QueryEngine::TiDB => {
-                        format!(
-                            "SELECT id, title, views FROM `{}` WHERE fts_match_word('{}', {}) ORDER BY views DESC LIMIT 10",
-                            self.table_name, escaped_word, field_name
-                        )
-                    }
-                    _ => {
-                        format!(
-                            "SELECT {} id, title, views FROM `{}` WHERE {} LIKE '%{}%' ORDER BY views DESC LIMIT 10",
-                            storage_hint, self.table_name, field_name, escaped_word
-                        )
-                    }
-                }
+                // TOP-N query ordered by views, selecting only PK
+                format!(
+                    "SELECT {} id FROM `{}` WHERE {} ORDER BY views DESC LIMIT 10",
+                    storage_prefix, self.table_name, match_predicate
+                )
             }
         }
     }
@@ -625,7 +623,77 @@ async fn fetch_sample_data(
     sqlx::query_as(&query).fetch_all(pool).await
 }
 
-fn extract_search_word(rng: &mut impl Rng, sample_data: &[SampleData]) -> Option<SearchQuery> {
+fn normalize_word(token: &str) -> Option<String> {
+    let trimmed = token.trim_matches(|c: char| !c.is_alphanumeric());
+    if trimmed.len() < 3 {
+        return None;
+    }
+    Some(trimmed.to_lowercase())
+}
+
+fn pick_word_from_text(rng: &mut impl Rng, text: &str) -> Option<String> {
+    let words: Vec<String> = text
+        .split_whitespace()
+        .filter_map(normalize_word)
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    Some(words[rng.gen_range(0..words.len())].clone())
+}
+
+fn build_rare_word_list(freq: HashMap<String, usize>) -> Vec<String> {
+    let mut items: Vec<(String, usize)> = freq.into_iter().collect();
+    if items.is_empty() {
+        return Vec::new();
+    }
+    items.sort_by_key(|(_, count)| *count);
+
+    let mut rare_words: Vec<String> = items
+        .iter()
+        .take_while(|(_, count)| *count <= 2)
+        .map(|(word, _)| word.clone())
+        .collect();
+
+    if rare_words.len() < 50 {
+        rare_words = items
+            .iter()
+            .take(200.min(items.len()))
+            .map(|(word, _)| word.clone())
+            .collect();
+    }
+
+    rare_words
+}
+
+fn build_rare_word_pool(sample_data: &[SampleData]) -> RareWordPool {
+    let mut title_freq: HashMap<String, usize> = HashMap::new();
+    let mut text_freq: HashMap<String, usize> = HashMap::new();
+
+    for sample in sample_data {
+        for token in sample.title.split_whitespace() {
+            if let Some(word) = normalize_word(token) {
+                *title_freq.entry(word).or_insert(0) += 1;
+            }
+        }
+        for token in sample.text.split_whitespace() {
+            if let Some(word) = normalize_word(token) {
+                *text_freq.entry(word).or_insert(0) += 1;
+            }
+        }
+    }
+
+    RareWordPool {
+        title_words: build_rare_word_list(title_freq),
+        text_words: build_rare_word_list(text_freq),
+    }
+}
+
+fn extract_search_word(
+    rng: &mut impl Rng,
+    sample_data: &[SampleData],
+    rare_words: Option<&RareWordPool>,
+) -> Option<SearchQuery> {
     let sample = sample_data.choose(rng)?;
     
     // Randomly choose between title and text field (75% title, 25% text)
@@ -634,14 +702,14 @@ fn extract_search_word(rng: &mut impl Rng, sample_data: &[SampleData]) -> Option
     } else {
         (FieldType::Text, &sample.text)
     };
-    
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.is_empty() {
-        return None;
+
+    if let Some(pool) = rare_words {
+        if let Some(word) = pool.pick_word(field, rng) {
+            return Some(SearchQuery { word, field });
+        }
     }
     
-    let word = words[rng.gen_range(0..words.len())].to_string();
-    Some(SearchQuery { word, field })
+    pick_word_from_text(rng, text).map(|word| SearchQuery { word, field })
 }
 
 // ============================================================================
@@ -660,7 +728,7 @@ async fn run_benchmark_worker(
     let mut stats = ThreadStats::new();
 
     while start_time.elapsed() < duration {
-        let Some(search_query) = extract_search_word(&mut rng, &sample_data) else {
+        let Some(search_query) = extract_search_word(&mut rng, &sample_data, None) else {
             continue;
         };
 
@@ -701,6 +769,7 @@ async fn run_benchmark_worker(
 async fn run_complex_benchmark_worker(
     executor: Arc<QueryExecutor>,
     sample_data: Arc<Vec<SampleData>>,
+    rare_words: Arc<RareWordPool>,
     start_time: Instant,
     duration: Duration,
     engine: QueryEngine,
@@ -717,7 +786,7 @@ async fn run_complex_benchmark_worker(
     ];
 
     while start_time.elapsed() < duration {
-        let Some(search_query) = extract_search_word(&mut rng, &sample_data) else {
+        let Some(search_query) = extract_search_word(&mut rng, &sample_data, Some(&rare_words)) else {
             continue;
         };
 
@@ -808,6 +877,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize query logger and executor
     let logger = Arc::new(QueryLogger::new(&args.output_file, &table_name)?);
     let executor = Arc::new(QueryExecutor::new(pool.clone(), table_name.clone(), logger.clone()));
+    let rare_words = Arc::new(build_rare_word_pool(&sample_data));
     let sample_data = Arc::new(sample_data);
     let duration = Duration::from_secs(args.duration);
 
@@ -824,10 +894,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..args.concurrency {
             let executor = executor.clone();
             let sample_data = sample_data.clone();
+            let rare_words = rare_words.clone();
             let verbose = args.verbose;
 
             let handle = tokio::spawn(async move {
-                run_complex_benchmark_worker(executor, sample_data, tidb_complex_start, duration, QueryEngine::TiDB, verbose).await
+                run_complex_benchmark_worker(executor, sample_data, rare_words, tidb_complex_start, duration, QueryEngine::TiDB, verbose).await
             });
 
             tidb_complex_handles.push(handle);
@@ -848,10 +919,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..args.concurrency {
             let executor = executor.clone();
             let sample_data = sample_data.clone();
+            let rare_words = rare_words.clone();
             let verbose = args.verbose;
 
             let handle = tokio::spawn(async move {
-                run_complex_benchmark_worker(executor, sample_data, tikv_complex_start, duration, QueryEngine::TiKV, verbose).await
+                run_complex_benchmark_worker(executor, sample_data, rare_words, tikv_complex_start, duration, QueryEngine::TiKV, verbose).await
             });
 
             tikv_complex_handles.push(handle);
@@ -872,10 +944,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..args.concurrency {
             let executor = executor.clone();
             let sample_data = sample_data.clone();
+            let rare_words = rare_words.clone();
             let verbose = args.verbose;
 
             let handle = tokio::spawn(async move {
-                run_complex_benchmark_worker(executor, sample_data, tiflash_complex_start, duration, QueryEngine::TiFlash, verbose).await
+                run_complex_benchmark_worker(executor, sample_data, rare_words, tiflash_complex_start, duration, QueryEngine::TiFlash, verbose).await
             });
 
             tiflash_complex_handles.push(handle);
