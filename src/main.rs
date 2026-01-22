@@ -67,7 +67,7 @@ struct SampleRow {
     title: String,
     text: String,
     vector: String,
-    views: Option<f64>,
+    views: Option<i64>,
     langs: Option<i32>,
 }
 
@@ -260,7 +260,7 @@ async fn run_insert(
     let text = sample.text.clone();
     let url = format!("https://example.com/wiki/{}", wiki_id);
     let views = match sample.views {
-        Some(v) if v.is_finite() => v,
+        Some(v) => v,
         _ => {
             if verbose {
                 println!("SKIP insert id={} due to empty views", id);
@@ -326,7 +326,7 @@ async fn run_update_mixed(
     // For composite primary key (id, wiki_id), we need both values
     // Use target_id as wiki_id for simplicity (same as insert logic)
     let target_wiki_id = target_id;
-    let extra_views: f64 = rng.gen_range(0.0..100.0);
+    let extra_views: i64 = rng.gen_range(0..100) as i64;
     let sample = pick_sample(rng, samples);
     let new_text = sample.text.clone();
     let new_vector = sample.vector.clone();
@@ -388,7 +388,7 @@ fn generate_random_samples(count: usize) -> Vec<SampleRow> {
         let title = generate_text(&mut rng, 32);
         let text = generate_text(&mut rng, 256);
         let vector = generate_vector_string(&mut rng);
-        let views = Some(rng.gen_range(0.0..1_000_000.0));
+        let views = Some(rng.gen_range(0..1_000_000) as i64);
         let langs = Some(rng.gen_range(1..10));
         samples.push(SampleRow { title, text, vector, views, langs });
     }
@@ -410,7 +410,7 @@ async fn create_table_with_index(pool: &Pool<MySql>, build_index: bool) -> Resul
           title         VARCHAR(512) NOT NULL,
           text          TEXT         NOT NULL,
           url           VARCHAR(512) NOT NULL,
-          views         DOUBLE       NOT NULL,
+          views         INT          NOT NULL,
           langs         INT          NOT NULL,
           vector        TEXT         NOT NULL,
           PRIMARY KEY (id, wiki_id,views, langs),
@@ -629,6 +629,10 @@ fn load_samples_from_parquet(
                 .and_then(|idx| batch.column(idx).as_any().downcast_ref::<Float64Array>());
             let views_arr_f32 = views_idx
                 .and_then(|idx| batch.column(idx).as_any().downcast_ref::<Float32Array>());
+            let views_arr_i32 = views_idx
+                .and_then(|idx| batch.column(idx).as_any().downcast_ref::<Int32Array>());
+            let views_arr_i64 = views_idx
+                .and_then(|idx| batch.column(idx).as_any().downcast_ref::<Int64Array>());
             let langs_arr_i32 = langs_idx
                 .and_then(|idx| batch.column(idx).as_any().downcast_ref::<Int32Array>());
             let langs_arr_i64 = langs_idx
@@ -660,10 +664,14 @@ fn load_samples_from_parquet(
                     vector.push_str(&format!("{:.6}", v));
                 }
 
-                let views = if let Some(arr) = views_arr_f64 {
+                let views = if let Some(arr) = views_arr_i64 {
                     if arr.is_null(row) { None } else { Some(arr.value(row)) }
+                } else if let Some(arr) = views_arr_i32 {
+                    if arr.is_null(row) { None } else { Some(arr.value(row) as i64) }
+                } else if let Some(arr) = views_arr_f64 {
+                    if arr.is_null(row) { None } else { Some(arr.value(row) as i64) }
                 } else if let Some(arr) = views_arr_f32 {
-                    if arr.is_null(row) { None } else { Some(arr.value(row) as f64) }
+                    if arr.is_null(row) { None } else { Some(arr.value(row) as i64) }
                 } else {
                     None
                 };
