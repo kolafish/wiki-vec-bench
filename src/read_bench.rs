@@ -71,6 +71,7 @@ struct Args {
 
 struct ThreadStats {
     tidb_latencies: Vec<u128>,
+    tikv_latencies: Vec<u128>,
     tiflash_latencies: Vec<u128>,
     errors: usize,
 }
@@ -79,6 +80,7 @@ impl ThreadStats {
     fn new() -> Self {
         Self {
             tidb_latencies: Vec::with_capacity(4096),
+            tikv_latencies: Vec::with_capacity(4096),
             tiflash_latencies: Vec::with_capacity(4096),
             errors: 0,
         }
@@ -86,6 +88,7 @@ impl ThreadStats {
 
     fn merge(&mut self, other: ThreadStats) {
         self.tidb_latencies.extend(other.tidb_latencies);
+        self.tikv_latencies.extend(other.tikv_latencies);
         self.tiflash_latencies.extend(other.tiflash_latencies);
         self.errors += other.errors;
     }
@@ -100,6 +103,7 @@ struct SampleData {
 #[derive(Clone, Copy, Debug)]
 enum QueryEngine {
     TiDB,
+    TiKV,
     TiFlash,
 }
 
@@ -107,9 +111,30 @@ impl QueryEngine {
     fn name(&self) -> &str {
         match self {
             QueryEngine::TiDB => "TiDB",
+            QueryEngine::TiKV => "TiKV",
             QueryEngine::TiFlash => "TiFlash",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FieldType {
+    Title,
+    Text,
+}
+
+impl FieldType {
+    fn name(&self) -> &str {
+        match self {
+            FieldType::Title => "title",
+            FieldType::Text => "text",
+        }
+    }
+}
+
+struct SearchQuery {
+    word: String,
+    field: FieldType,
 }
 
 // ============================================================================
@@ -137,9 +162,9 @@ impl QueryLogger {
         })
     }
 
-    fn log_query(&self, engine: QueryEngine, sql: &str) {
+    fn log_query(&self, engine: QueryEngine, sql: &str, duration: Duration) {
         if let Ok(mut writer) = self.writer.lock() {
-            let _ = writeln!(writer, "-- {} Query", engine.name());
+            let _ = writeln!(writer, "-- {} Query (Execution time: {:.2}ms)", engine.name(), duration.as_secs_f64() * 1000.0);
             let _ = writeln!(writer, "{}\n", sql.trim());
         }
     }
@@ -167,23 +192,32 @@ impl QueryBuilder {
 
     /// Build FTS query for specific engine
     /// TiDB uses fts_match_word (full-text index)
-    /// TiFlash uses LIKE (string matching, as fts_match_word is not supported)
-    fn build_fts_query(&self, search_word: &str, engine: QueryEngine) -> String {
+    /// TiKV uses LIKE (string matching without hint)
+    /// TiFlash uses LIKE (string matching with TIFLASH hint, as fts_match_word is not supported)
+    fn build_fts_query(&self, search_word: &str, field: FieldType, engine: QueryEngine) -> String {
         let escaped_word = Self::escape_sql_string(search_word);
+        let field_name = field.name();
         
         match engine {
             QueryEngine::TiDB => {
-                // TiDB: Use fts_match_word with FULLTEXT index
+                // TiDB: Use fts_match_word with FULLTEXT index on specific field
                 format!(
-                    "SELECT count(*) FROM `{}` WHERE fts_match_word('{}', text) OR fts_match_word('{}', title)",
-                    self.table_name, escaped_word, escaped_word
+                    "SELECT count(*) FROM `{}` WHERE fts_match_word('{}', {})",
+                    self.table_name, escaped_word, field_name
+                )
+            }
+            QueryEngine::TiKV => {
+                // TiKV: Use LIKE for string matching on specific field (without hint, defaults to TiKV)
+                format!(
+                    "SELECT /*+ READ_FROM_STORAGE(TIKV[`{}`]) */ count(*) FROM `{}` WHERE {} LIKE '%{}%'",
+                    self.table_name, self.table_name, field_name, escaped_word
                 )
             }
             QueryEngine::TiFlash => {
-                // TiFlash: Use LIKE for string matching (fts_match_word not supported)
+                // TiFlash: Use LIKE for string matching on specific field (fts_match_word not supported)
                 format!(
-                    "SELECT /*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */ count(*) FROM `{}` WHERE text LIKE '%{}%' OR title LIKE '%{}%'",
-                    self.table_name, self.table_name, escaped_word, escaped_word
+                    "SELECT /*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */ count(*) FROM `{}` WHERE {} LIKE '%{}%'",
+                    self.table_name, self.table_name, field_name, escaped_word
                 )
             }
         }
@@ -223,13 +257,11 @@ impl QueryExecutor {
     async fn execute_query(
         &self,
         search_word: &str,
+        field: FieldType,
         engine: QueryEngine,
         verbose: bool,
     ) -> Result<Duration, sqlx::Error> {
-        let query = self.query_builder.build_fts_query(search_word, engine);
-        
-        // Log to file
-        self.logger.log_query(engine, &query);
+        let query = self.query_builder.build_fts_query(search_word, field, engine);
         
         let start = Instant::now();
         let count: i64 = sqlx::query_scalar(&query)
@@ -237,10 +269,13 @@ impl QueryExecutor {
             .await?;
         let duration = start.elapsed();
 
+        // Log to file with execution time
+        self.logger.log_query(engine, &query, duration);
+
         if verbose {
             println!("---------------------------------------------------");
-            println!("[{}] Time: {:?} | Count: {} | Word: '{}'", 
-                engine.name(), duration.as_millis(), count, search_word);
+            println!("[{}] Time: {:?} | Count: {} | Field: {} | Word: '{}'", 
+                engine.name(), duration.as_millis(), count, field.name(), search_word);
             println!("SQL: {}", query);
         }
 
@@ -462,13 +497,23 @@ async fn fetch_sample_data(
     sqlx::query_as(&query).fetch_all(pool).await
 }
 
-fn extract_search_word(rng: &mut impl Rng, sample_data: &[SampleData]) -> Option<String> {
+fn extract_search_word(rng: &mut impl Rng, sample_data: &[SampleData]) -> Option<SearchQuery> {
     let sample = sample_data.choose(rng)?;
-    let words: Vec<&str> = sample.text.split_whitespace().collect();
+    
+    // Randomly choose between title and text field
+    let (field, text) = if rng.gen_bool(0.5) {
+        (FieldType::Title, &sample.title)
+    } else {
+        (FieldType::Text, &sample.text)
+    };
+    
+    let words: Vec<&str> = text.split_whitespace().collect();
     if words.is_empty() {
         return None;
     }
-    Some(words[rng.gen_range(0..words.len())].to_string())
+    
+    let word = words[rng.gen_range(0..words.len())].to_string();
+    Some(SearchQuery { word, field })
 }
 
 // ============================================================================
@@ -487,13 +532,13 @@ async fn run_benchmark_worker(
     let mut stats = ThreadStats::new();
 
     while start_time.elapsed() < duration {
-        let Some(search_word) = extract_search_word(&mut rng, &sample_data) else {
+        let Some(search_query) = extract_search_word(&mut rng, &sample_data) else {
             continue;
         };
 
         match engine {
             QueryEngine::TiDB => {
-                match executor.execute_query(&search_word, QueryEngine::TiDB, verbose).await {
+                match executor.execute_query(&search_query.word, search_query.field, QueryEngine::TiDB, verbose).await {
                     Ok(dur) => stats.tidb_latencies.push(dur.as_micros()),
                     Err(e) => {
                         eprintln!("TiDB query error: {}", e);
@@ -501,8 +546,17 @@ async fn run_benchmark_worker(
                     }
                 }
             }
+            QueryEngine::TiKV => {
+                match executor.execute_query(&search_query.word, search_query.field, QueryEngine::TiKV, verbose).await {
+                    Ok(dur) => stats.tikv_latencies.push(dur.as_micros()),
+                    Err(e) => {
+                        eprintln!("TiKV query error: {}", e);
+                        stats.errors += 1;
+                    }
+                }
+            }
             QueryEngine::TiFlash => {
-                match executor.execute_query(&search_word, QueryEngine::TiFlash, verbose).await {
+                match executor.execute_query(&search_query.word, search_query.field, QueryEngine::TiFlash, verbose).await {
                     Ok(dur) => stats.tiflash_latencies.push(dur.as_micros()),
                     Err(e) => {
                         eprintln!("TiFlash query error: {}", e);
@@ -594,8 +648,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tidb_elapsed = tidb_start.elapsed();
     println!("✓ TiDB benchmark completed in {:.2?}\n", tidb_elapsed);
 
-    // Phase 2: Benchmark TiFlash
-    println!("=== Phase 2: Benchmarking TiFlash ===");
+    // Phase 2: Benchmark TiKV
+    println!("=== Phase 2: Benchmarking TiKV ===");
+    let tikv_start = Instant::now();
+    let mut tikv_handles = Vec::with_capacity(args.concurrency);
+
+    for _ in 0..args.concurrency {
+        let executor = executor.clone();
+        let sample_data = sample_data.clone();
+        let verbose = args.verbose;
+
+        let handle = tokio::spawn(async move {
+            run_benchmark_worker(executor, sample_data, tikv_start, duration, QueryEngine::TiKV, verbose).await
+        });
+
+        tikv_handles.push(handle);
+    }
+
+    // Collect TiKV results
+    let mut tikv_stats = ThreadStats::new();
+    for handle in tikv_handles {
+        tikv_stats.merge(handle.await?);
+    }
+    let tikv_elapsed = tikv_start.elapsed();
+    println!("✓ TiKV benchmark completed in {:.2?}\n", tikv_elapsed);
+
+    // Phase 3: Benchmark TiFlash
+    println!("=== Phase 3: Benchmarking TiFlash ===");
     let tiflash_start = Instant::now();
     let mut tiflash_handles = Vec::with_capacity(args.concurrency);
 
@@ -622,28 +701,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Combine stats for final reporting
     let mut combined_stats = ThreadStats::new();
     combined_stats.tidb_latencies = tidb_stats.tidb_latencies;
+    combined_stats.tikv_latencies = tikv_stats.tikv_latencies;
     combined_stats.tiflash_latencies = tiflash_stats.tiflash_latencies;
-    combined_stats.errors = tidb_stats.errors + tiflash_stats.errors;
+    combined_stats.errors = tidb_stats.errors + tikv_stats.errors + tiflash_stats.errors;
 
-    let total_elapsed = tidb_elapsed + tiflash_elapsed;
+    let total_elapsed = tidb_elapsed + tikv_elapsed + tiflash_elapsed;
 
     // Print results
     println!("\n=== Summary ===");
     println!("TiDB elapsed   : {:.2?}", tidb_elapsed);
+    println!("TiKV elapsed   : {:.2?}", tikv_elapsed);
     println!("TiFlash elapsed: {:.2?}", tiflash_elapsed);
     println!("Total elapsed  : {:.2?}", total_elapsed);
     println!("Total errors   : {}\n", combined_stats.errors);
 
     print_statistics("TiDB", &mut combined_stats.tidb_latencies, tidb_elapsed);
     println!();
+    print_statistics("TiKV", &mut combined_stats.tikv_latencies, tikv_elapsed);
+    println!();
     print_statistics("TiFlash", &mut combined_stats.tiflash_latencies, tiflash_elapsed);
 
     // Print comparison
-    if !combined_stats.tidb_latencies.is_empty() && !combined_stats.tiflash_latencies.is_empty() {
+    if !combined_stats.tidb_latencies.is_empty() 
+        && !combined_stats.tikv_latencies.is_empty() 
+        && !combined_stats.tiflash_latencies.is_empty() {
         let tidb_qps = combined_stats.tidb_latencies.len() as f64 / tidb_elapsed.as_secs_f64();
+        let tikv_qps = combined_stats.tikv_latencies.len() as f64 / tikv_elapsed.as_secs_f64();
         let tiflash_qps = combined_stats.tiflash_latencies.len() as f64 / tiflash_elapsed.as_secs_f64();
         println!("\n--- Comparison ---");
+        println!("TiDB   QPS: {:.2}", tidb_qps);
+        println!("TiKV   QPS: {:.2}", tikv_qps);
+        println!("TiFlash QPS: {:.2}", tiflash_qps);
+        println!("QPS ratio (TiKV/TiDB): {:.2}x", tikv_qps / tidb_qps);
         println!("QPS ratio (TiFlash/TiDB): {:.2}x", tiflash_qps / tidb_qps);
+        println!("QPS ratio (TiFlash/TiKV): {:.2}x", tiflash_qps / tikv_qps);
     }
 
     logger.flush()?;
