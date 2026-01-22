@@ -12,7 +12,7 @@ use std::fs::File;
 use std::path::Path;
 use std::process::Command;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use arrow_array::{ArrayRef, StringArray, ListArray, Float32Array};
+use arrow_array::{ArrayRef, StringArray, ListArray, Float32Array, Float64Array, Int32Array, Int64Array};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "TiDB OLTP benchmark for wiki_paragraphs_embeddings")]
@@ -67,12 +67,15 @@ struct SampleRow {
     title: String,
     text: String,
     vector: String,
+    views: Option<f64>,
+    langs: Option<i32>,
 }
 
 #[derive(Copy, Clone)]
 enum OpKind {
     Insert,
     Update,
+    Skip,
 }
 
 #[tokio::main]
@@ -143,12 +146,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 match result {
                     Ok((rows, kind)) => {
+                        if matches!(kind, OpKind::Skip) {
+                            continue;
+                        }
                         let micros = op_start.elapsed().as_micros();
                         stats.latencies.push(micros);
                         stats.rows += rows as u64;
                         match kind {
                             OpKind::Insert => stats.inserts += 1,
                             OpKind::Update => stats.updates += 1,
+                            OpKind::Skip => {}
                         }
                     }
                     Err(e) => {
@@ -252,8 +259,24 @@ async fn run_insert(
     let title = sample.title.clone();
     let text = sample.text.clone();
     let url = format!("https://example.com/wiki/{}", wiki_id);
-    let views: f64 = rng.gen_range(0.0..1_000_000.0);
-    let langs: i32 = rng.gen_range(1..10);
+    let views = match sample.views {
+        Some(v) if v.is_finite() => v,
+        _ => {
+            if verbose {
+                println!("SKIP insert id={} due to empty views", id);
+            }
+            return Ok((0, OpKind::Skip));
+        }
+    };
+    let langs = match sample.langs {
+        Some(v) => v,
+        None => {
+            if verbose {
+                println!("SKIP insert id={} due to empty langs", id);
+            }
+            return Ok((0, OpKind::Skip));
+        }
+    };
     let vector = sample.vector.clone();
 
     let sql = format!(
@@ -365,7 +388,9 @@ fn generate_random_samples(count: usize) -> Vec<SampleRow> {
         let title = generate_text(&mut rng, 32);
         let text = generate_text(&mut rng, 256);
         let vector = generate_vector_string(&mut rng);
-        samples.push(SampleRow { title, text, vector });
+        let views = Some(rng.gen_range(0.0..1_000_000.0));
+        let langs = Some(rng.gen_range(1..10));
+        samples.push(SampleRow { title, text, vector, views, langs });
     }
 
     samples
@@ -485,6 +510,7 @@ fn load_samples_from_parquet(
 ) -> Result<Vec<SampleRow>, Box<dyn Error>> {
     let mut samples = Vec::new();
     let mut corrupted_files = Vec::new();
+    let mut fallback_rng = StdRng::seed_from_u64(7);
 
     let mut entries: Vec<_> = std::fs::read_dir(raw_dir)?
         .filter_map(|e| e.ok())
@@ -598,6 +624,18 @@ fn load_samples_from_parquet(
                 }
             };
 
+            let views_idx = batch.schema().index_of("views").ok();
+            let langs_idx = batch.schema().index_of("langs").ok();
+
+            let views_arr_f64 = views_idx
+                .and_then(|idx| batch.column(idx).as_any().downcast_ref::<Float64Array>());
+            let views_arr_f32 = views_idx
+                .and_then(|idx| batch.column(idx).as_any().downcast_ref::<Float32Array>());
+            let langs_arr_i32 = langs_idx
+                .and_then(|idx| batch.column(idx).as_any().downcast_ref::<Int32Array>());
+            let langs_arr_i64 = langs_idx
+                .and_then(|idx| batch.column(idx).as_any().downcast_ref::<Int64Array>());
+
             for row in 0..batch.num_rows() {
                 if samples.len() >= max_rows {
                     break;
@@ -624,7 +662,23 @@ fn load_samples_from_parquet(
                     vector.push_str(&format!("{:.6}", v));
                 }
 
-                samples.push(SampleRow { title, text, vector });
+                let views = if let Some(arr) = views_arr_f64 {
+                    if arr.is_null(row) { None } else { Some(arr.value(row)) }
+                } else if let Some(arr) = views_arr_f32 {
+                    if arr.is_null(row) { None } else { Some(arr.value(row) as f64) }
+                } else {
+                    Some(fallback_rng.gen_range(0.0..1_000_000.0))
+                };
+
+                let langs = if let Some(arr) = langs_arr_i32 {
+                    if arr.is_null(row) { None } else { Some(arr.value(row)) }
+                } else if let Some(arr) = langs_arr_i64 {
+                    if arr.is_null(row) { None } else { Some(arr.value(row) as i32) }
+                } else {
+                    Some(fallback_rng.gen_range(1..10))
+                };
+
+                samples.push(SampleRow { title, text, vector, views, langs });
                 file_loaded = true;
             }
         }
