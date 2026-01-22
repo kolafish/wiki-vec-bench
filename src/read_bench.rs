@@ -50,8 +50,9 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use sqlx::mysql::{MySqlPoolOptions, MySqlConnectOptions};
 use sqlx::{Pool, MySql};
+use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
@@ -72,6 +73,10 @@ struct Args {
     /// Enable verbose logging (print individual SQLs)
     #[arg(long, default_value_t = false)]
     verbose: bool,
+
+    /// Output file path for SQL queries log
+    #[arg(long, default_value = "read_bench_queries.sql")]
+    output_file: String,
 }
 
 struct ThreadStats {
@@ -104,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("concurrency    : {}", args.concurrency);
     println!("duration       : {}s", args.duration);
     println!("sample_size    : {}", args.sample_size);
+    println!("output_file    : {}", args.output_file);
 
     // Global TiDB connection settings
     let opts = MySqlConnectOptions::new()
@@ -126,9 +132,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("using table: {}", table_name);
 
+    // Print table statistics
+    print_table_statistics(&pool, &table_name).await?;
+
     // Check if TiFlash replica exists and verify query execution
     check_tiflash_replica(&pool, &table_name).await?;
     verify_tiflash_query(&pool, &table_name).await?;
+
+    // Create output file for SQL queries
+    let output_file = Arc::new(Mutex::new(
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&args.output_file)?,
+    ));
+    
+    // Write header to output file
+    {
+        let mut file = output_file.lock().unwrap();
+        writeln!(file, "-- TiDB Read Benchmark SQL Queries")?;
+        writeln!(file, "-- Table: {}", table_name)?;
+        writeln!(file, "-- Generated at: {:?}", std::time::SystemTime::now())?;
+        writeln!(file, "")?;
+    }
 
     // Sample test data from the table
     println!("> Sampling {} rows (title, text) from database...", args.sample_size);
@@ -150,6 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let data_pool = shared_data.clone();
         let table_name = table_name.clone();
         let verbose = args.verbose;
+        let output_file = output_file.clone();
 
         let handle = tokio::spawn(async move {
             let mut rng = StdRng::from_entropy();
@@ -165,7 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let search_word = words[rng.gen_range(0..words.len())].to_string();
 
                 // Run query on TiDB
-                match run_query_tidb(&pool, &table_name, &search_word, verbose).await {
+                match run_query_tidb(&pool, &table_name, &search_word, verbose, &output_file).await {
                     Ok(duration) => {
                         let micros = duration.as_micros();
                         stats.tidb_latencies.push(micros);
@@ -177,7 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Run the same query on TiFlash
-                match run_query_tiflash(&pool, &table_name, &search_word, verbose).await {
+                match run_query_tiflash(&pool, &table_name, &search_word, verbose, &output_file).await {
                     Ok(duration) => {
                         let micros = duration.as_micros();
                         stats.tiflash_latencies.push(micros);
@@ -236,6 +264,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("QPS ratio (TiFlash/TiDB): {:.2}x", qps_ratio);
     }
 
+    println!();
+    println!("✓ SQL queries have been saved to: {}", args.output_file);
+
     Ok(())
 }
 
@@ -280,6 +311,116 @@ async fn find_latest_table(pool: &Pool<MySql>) -> Result<String, sqlx::Error> {
     Ok(result.unwrap_or_default())
 }
 
+/// Print table statistics including row count, table size, etc.
+async fn print_table_statistics(pool: &Pool<MySql>, table_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!();
+    println!("--- Table Statistics ---");
+    
+    // Get row count
+    let count_query = format!("SELECT COUNT(*) FROM `{}`", table_name);
+    let row_count: i64 = sqlx::query_scalar(&count_query)
+        .fetch_one(pool)
+        .await?;
+    println!("Total rows      : {}", row_count);
+    
+    // Get table size information
+    let size_query = r#"
+        SELECT 
+            table_rows,
+            data_length,
+            index_length,
+            (data_length + index_length) as total_size
+        FROM information_schema.tables
+        WHERE table_schema = 'test' AND table_name = ?
+    "#;
+    
+    #[derive(sqlx::FromRow)]
+    struct TableSize {
+        table_rows: Option<u64>,
+        data_length: Option<u64>,
+        index_length: Option<u64>,
+        total_size: Option<u64>,
+    }
+    
+    if let Ok(Some(size_info)) = sqlx::query_as::<_, TableSize>(size_query)
+        .bind(table_name)
+        .fetch_optional(pool)
+        .await
+    {
+        if let Some(rows) = size_info.table_rows {
+            println!("Table rows (est) : {}", rows);
+        }
+        
+        let format_bytes = |bytes: Option<u64>| -> String {
+            bytes.map_or("N/A".to_string(), |b| {
+                if b < 1024 {
+                    format!("{} B", b)
+                } else if b < 1024 * 1024 {
+                    format!("{:.2} KB", b as f64 / 1024.0)
+                } else if b < 1024 * 1024 * 1024 {
+                    format!("{:.2} MB", b as f64 / (1024.0 * 1024.0))
+                } else {
+                    format!("{:.2} GB", b as f64 / (1024.0 * 1024.0 * 1024.0))
+                }
+            })
+        };
+        
+        println!("Data size       : {}", format_bytes(size_info.data_length));
+        println!("Index size      : {}", format_bytes(size_info.index_length));
+        println!("Total size      : {}", format_bytes(size_info.total_size));
+    }
+    
+    // Get column information
+    let col_query = r#"
+        SELECT 
+            column_name,
+            data_type,
+            character_maximum_length
+        FROM information_schema.columns
+        WHERE table_schema = 'test' AND table_name = ?
+        ORDER BY ordinal_position
+    "#;
+    
+    #[derive(sqlx::FromRow)]
+    struct ColumnInfo {
+        column_name: String,
+        data_type: String,
+        character_maximum_length: Option<u64>,
+    }
+    
+    if let Ok(columns) = sqlx::query_as::<_, ColumnInfo>(col_query)
+        .bind(table_name)
+        .fetch_all(pool)
+        .await
+    {
+        println!("Columns         : {}", columns.len());
+        if columns.len() <= 10 {
+            for col in &columns {
+                let col_type = if let Some(max_len) = col.character_maximum_length {
+                    format!("{}({})", col.data_type, max_len)
+                } else {
+                    col.data_type.clone()
+                };
+                println!("  - {} : {}", col.column_name, col_type);
+            }
+        } else {
+            for col in columns.iter().take(5) {
+                let col_type = if let Some(max_len) = col.character_maximum_length {
+                    format!("{}({})", col.data_type, max_len)
+                } else {
+                    col.data_type.clone()
+                };
+                println!("  - {} : {}", col.column_name, col_type);
+            }
+            println!("  ... and {} more columns", columns.len() - 5);
+        }
+    }
+    
+    println!();
+    
+    Ok(())
+}
+
 async fn fetch_sample_data(
     pool: &Pool<MySql>,
     table_name: &str,
@@ -302,6 +443,7 @@ async fn run_query_tidb(
     table_name: &str,
     search_word: &str,
     verbose: bool,
+    output_file: &Arc<Mutex<std::fs::File>>,
 ) -> Result<Duration, sqlx::Error> {
     let start = Instant::now();
     let query = format!(
@@ -312,6 +454,16 @@ async fn run_query_tidb(
         "#,
         table_name
     );
+    
+    // Log SQL query to file
+    let sql_with_values = format!(
+        "SELECT count(*) FROM `{}` WHERE fts_match_word(title, '{}') OR fts_match_word(text, '{}');\n",
+        table_name, search_word, search_word
+    );
+    if let Ok(mut file) = output_file.lock() {
+        let _ = writeln!(file, "-- TiDB Query");
+        let _ = writeln!(file, "{}", sql_with_values);
+    }
     
     let count: i64 = sqlx::query_scalar(&query)
         .bind(search_word)
@@ -324,9 +476,7 @@ async fn run_query_tidb(
     if verbose {
         println!("---------------------------------------------------");
         println!("[TiDB] Time: {:?} | Count: {} | Word: '{}'", duration.as_millis(), count, search_word);
-        println!("SQL: SELECT count(*) FROM `{}` WHERE fts_match_word(title, '{}') OR fts_match_word(text, '{}');",
-            table_name, search_word, search_word
-        );
+        println!("SQL: {}", sql_with_values.trim());
     }
     
     Ok(duration)
@@ -337,6 +487,7 @@ async fn run_query_tiflash(
     table_name: &str,
     search_word: &str,
     verbose: bool,
+    output_file: &Arc<Mutex<std::fs::File>>,
 ) -> Result<Duration, sqlx::Error> {
     let start = Instant::now();
     // Use TiFlash by SQL hint: READ_FROM_STORAGE(TIFLASH[table])
@@ -351,6 +502,16 @@ async fn run_query_tiflash(
         table_name, table_name
     );
     
+    // Log SQL query to file
+    let sql_with_values = format!(
+        "SELECT /*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */ count(*) FROM `{}` WHERE fts_match_word(title, '{}') OR fts_match_word(text, '{}');\n",
+        table_name, table_name, search_word, search_word
+    );
+    if let Ok(mut file) = output_file.lock() {
+        let _ = writeln!(file, "-- TiFlash Query");
+        let _ = writeln!(file, "{}", sql_with_values);
+    }
+    
     let count: i64 = sqlx::query_scalar(&query)
         .bind(search_word)
         .bind(search_word)
@@ -362,9 +523,7 @@ async fn run_query_tiflash(
     if verbose {
         println!("---------------------------------------------------");
         println!("[TiFlash] Time: {:?} | Count: {} | Word: '{}'", duration.as_millis(), count, search_word);
-        println!("SQL: SELECT /*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */ count(*) FROM `{}` WHERE fts_match_word(title, '{}') OR fts_match_word(text, '{}');",
-            table_name, table_name, search_word, search_word
-        );
+        println!("SQL: {}", sql_with_values.trim());
     }
     
     Ok(duration)
