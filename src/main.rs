@@ -410,8 +410,8 @@ async fn create_table_with_index(pool: &Pool<MySql>, build_index: bool) -> Resul
           title         VARCHAR(512) NOT NULL,
           text          TEXT         NOT NULL,
           url           VARCHAR(512) NOT NULL,
-          views         DOUBLE       NULL,
-          langs         INT          NULL,
+          views         DOUBLE       NOT NULL,
+          langs         INT          NOT NULL,
           vector        TEXT         NOT NULL,
           PRIMARY KEY (id, wiki_id,views, langs),
           KEY idx_wiki_para (wiki_id, paragraph_id)
@@ -510,8 +510,6 @@ fn load_samples_from_parquet(
 ) -> Result<Vec<SampleRow>, Box<dyn Error>> {
     let mut samples = Vec::new();
     let mut corrupted_files = Vec::new();
-    let mut fallback_rng = StdRng::seed_from_u64(7);
-
     let mut entries: Vec<_> = std::fs::read_dir(raw_dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -667,7 +665,7 @@ fn load_samples_from_parquet(
                 } else if let Some(arr) = views_arr_f32 {
                     if arr.is_null(row) { None } else { Some(arr.value(row) as f64) }
                 } else {
-                    Some(fallback_rng.gen_range(0.0..1_000_000.0))
+                    None
                 };
 
                 let langs = if let Some(arr) = langs_arr_i32 {
@@ -675,7 +673,7 @@ fn load_samples_from_parquet(
                 } else if let Some(arr) = langs_arr_i64 {
                     if arr.is_null(row) { None } else { Some(arr.value(row) as i32) }
                 } else {
-                    Some(fallback_rng.gen_range(1..10))
+                    None
                 };
 
                 samples.push(SampleRow { title, text, vector, views, langs });
