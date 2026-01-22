@@ -420,15 +420,13 @@ fn ensure_samples() -> Result<Vec<SampleRow>, Box<dyn Error>> {
     std::fs::create_dir_all(&raw_dir)?;
 
     // Check if there is at least one parquet file; if not, download.
-    let has_parquet = std::fs::read_dir(&raw_dir)?
+    let parquet_files: Vec<_> = std::fs::read_dir(&raw_dir)?
         .filter_map(|e| e.ok())
-        .any(|e| e
-            .path()
-            .extension()
-            .and_then(|s| s.to_str())
-            == Some("parquet"));
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("parquet"))
+        .collect();
 
-    if !has_parquet {
+    if parquet_files.is_empty() {
         println!("no parquet files under ./data/raw, downloading dataset via Python script...");
         let status = Command::new("python3")
             .arg("scripts/download_wiki_embeddings.py")
@@ -436,39 +434,33 @@ fn ensure_samples() -> Result<Vec<SampleRow>, Box<dyn Error>> {
         if !status.success() {
             return Err("python scripts/download_wiki_embeddings.py failed".into());
         }
-        // Re-check for parquet files after download
-        let parquet_files: Vec<_> = std::fs::read_dir(&raw_dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("parquet"))
-            .collect();
-        if parquet_files.is_empty() {
-            eprintln!("warning: Python script completed but no parquet files found in {:?}", raw_dir);
-            eprintln!("listing all files in {:?}:", raw_dir);
-            if let Ok(entries) = std::fs::read_dir(&raw_dir) {
-                for entry in entries.flatten() {
-                    eprintln!("  {:?}", entry.path());
-                }
-            }
-            return Err("no parquet files found after download".into());
-        }
-        println!("found {} parquet file(s) after download", parquet_files.len());
     }
 
-    // Try to load samples; if all files are corrupted or no samples loaded, trigger re-download
+    // Try to load samples from existing parquet files
     match load_samples_from_parquet(&raw_dir, 200_000) {
-        Ok(samples) if !samples.is_empty() => Ok(samples),
-        Ok(_) | Err(_) => {
-            eprintln!("warning: failed to load valid samples, all parquet files may be corrupted");
-            eprintln!("triggering re-download...");
+        Ok(samples) if !samples.is_empty() => {
+            Ok(samples)
+        },
+        Ok(_) | Err(e) => {
+            eprintln!("warning: failed to load samples from existing parquet files: {:?}", e);
+            eprintln!("checking and re-downloading missing or corrupted shards...");
+            
+            // Run the download script, which will intelligently check existing files
+            // and only download missing/corrupted shards
             let status = Command::new("python3")
                 .arg("scripts/download_wiki_embeddings.py")
                 .status()?;
             if !status.success() {
                 return Err("python scripts/download_wiki_embeddings.py failed during re-download".into());
             }
+            
             // Try loading again after re-download
-            load_samples_from_parquet(&raw_dir, 200_000)
+            let samples = load_samples_from_parquet(&raw_dir, 200_000)?;
+            if samples.is_empty() {
+                return Err("no samples loaded after re-download".into());
+            }
+            println!("successfully loaded {} samples after re-download", samples.len());
+            Ok(samples)
         }
     }
 }
@@ -483,6 +475,7 @@ fn load_samples_from_parquet(
     max_rows: usize,
 ) -> Result<Vec<SampleRow>, Box<dyn Error>> {
     let mut samples = Vec::new();
+    let mut corrupted_files = Vec::new();
 
     let mut entries: Vec<_> = std::fs::read_dir(raw_dir)?
         .filter_map(|e| e.ok())
@@ -496,80 +489,122 @@ fn load_samples_from_parquet(
 
     // Deterministic order
     entries.sort();
+    let total_files = entries.len();
+    let mut loaded_files = 0;
 
     for path in entries {
         if samples.len() >= max_rows {
             break;
         }
+        
+        let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
         println!("loading samples from {:?}", path);
+        
         let file = match File::open(&path) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("warning: failed to open {:?}: {}, skipping", path, e);
+                corrupted_files.push(file_name);
                 continue;
             }
         };
+        
         let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("warning: failed to read parquet file {:?}: {}, skipping", path, e);
+                corrupted_files.push(file_name);
                 continue;
             }
         };
+        
         let mut reader = match builder.with_batch_size(1024).build() {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("warning: failed to build parquet reader for {:?}: {}, skipping", path, e);
+                corrupted_files.push(file_name);
                 continue;
             }
         };
 
+        let mut file_loaded = false;
         while let Some(batch_result) = reader.next() {
             let batch = match batch_result {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("warning: failed to read batch from {:?}: {}, skipping remaining batches", path, e);
+                    if !file_loaded {
+                        corrupted_files.push(file_name.clone());
+                    }
                     break;
                 }
             };
-            let schema = batch.schema();
-            let title_idx = schema.index_of("title")?;
-            let text_idx = schema.index_of("text")?;
-            let emb_idx = schema.index_of("emb")?;
+            
+            // Use match to handle schema errors gracefully
+            let (title_idx, text_idx, emb_idx) = match (
+                batch.schema().index_of("title"),
+                batch.schema().index_of("text"),
+                batch.schema().index_of("emb"),
+            ) {
+                (Ok(t), Ok(txt), Ok(e)) => (t, txt, e),
+                _ => {
+                    eprintln!("warning: parquet file {:?} has invalid schema, skipping", path);
+                    if !file_loaded {
+                        corrupted_files.push(file_name.clone());
+                    }
+                    break;
+                }
+            };
 
-            let title_arr = batch
-                .column(title_idx)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or("title column is not StringArray")?;
-            let text_arr = batch
-                .column(text_idx)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or("text column is not StringArray")?;
-            let emb_arr = batch
-                .column(emb_idx)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or("emb column is not ListArray")?;
+            let title_arr = match batch.column(title_idx).as_any().downcast_ref::<StringArray>() {
+                Some(arr) => arr,
+                None => {
+                    eprintln!("warning: title column in {:?} is not StringArray, skipping file", path);
+                    if !file_loaded {
+                        corrupted_files.push(file_name.clone());
+                    }
+                    break;
+                }
+            };
+            
+            let text_arr = match batch.column(text_idx).as_any().downcast_ref::<StringArray>() {
+                Some(arr) => arr,
+                None => {
+                    eprintln!("warning: text column in {:?} is not StringArray, skipping file", path);
+                    if !file_loaded {
+                        corrupted_files.push(file_name.clone());
+                    }
+                    break;
+                }
+            };
+            
+            let emb_arr = match batch.column(emb_idx).as_any().downcast_ref::<ListArray>() {
+                Some(arr) => arr,
+                None => {
+                    eprintln!("warning: emb column in {:?} is not ListArray, skipping file", path);
+                    if !file_loaded {
+                        corrupted_files.push(file_name.clone());
+                    }
+                    break;
+                }
+            };
 
             for row in 0..batch.num_rows() {
                 if samples.len() >= max_rows {
                     break;
                 }
 
-                let title = title_arr
-                    .value(row)
-                    .to_string();
-                let text = text_arr
-                    .value(row)
-                    .to_string();
+                let title = title_arr.value(row).to_string();
+                let text = text_arr.value(row).to_string();
 
                 let values: ArrayRef = emb_arr.value(row);
-                let float_arr = values
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or("emb inner values are not Float32Array")?;
+                let float_arr = match values.as_any().downcast_ref::<Float32Array>() {
+                    Some(arr) => arr,
+                    None => {
+                        eprintln!("warning: emb values in {:?} are not Float32Array, skipping row", path);
+                        continue;
+                    }
+                };
 
                 let mut vector = String::new();
                 for i in 0..float_arr.len() {
@@ -581,13 +616,29 @@ fn load_samples_from_parquet(
                 }
 
                 samples.push(SampleRow { title, text, vector });
+                file_loaded = true;
             }
+        }
+        
+        if file_loaded {
+            loaded_files += 1;
+        }
+    }
+
+    if !corrupted_files.is_empty() {
+        eprintln!("warning: {} of {} parquet files were corrupted or unreadable:", 
+                  corrupted_files.len(), total_files);
+        for file in &corrupted_files {
+            eprintln!("  - {}", file);
         }
     }
 
     if samples.is_empty() {
         return Err("no samples loaded from parquet files".into());
     }
+
+    println!("successfully loaded {} samples from {}/{} parquet files", 
+             samples.len(), loaded_files, total_files);
 
     Ok(samples)
 }
