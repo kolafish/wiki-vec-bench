@@ -450,14 +450,14 @@ async fn run_query_tidb(
         r#"
         SELECT count(*) 
         FROM `{}` 
-        WHERE fts_match_word(title, ?) OR fts_match_word(text, ?)
+        WHERE fts_match_word(?, text) OR fts_match_word(?, title)
         "#,
         table_name
     );
     
     // Log SQL query to file
     let sql_with_values = format!(
-        "SELECT count(*) FROM `{}` WHERE fts_match_word(title, '{}') OR fts_match_word(text, '{}');\n",
+        "SELECT count(*) FROM `{}` WHERE fts_match_word('{}', text) OR fts_match_word('{}', title);\n",
         table_name, search_word, search_word
     );
     if let Ok(mut file) = output_file.lock() {
