@@ -145,22 +145,17 @@ executor.execute_query(word, QueryEngine::TiFlash, verbose)
 
 ### Building
 ```bash
-# Add to Cargo.toml
-[[bin]]
-name = "read-bench-refactored"
-path = "src/read_bench_refactored.rs"
-
-# Build
+cd wiki-vec-bench
 cargo build --release
 ```
 
 ### Running
 ```bash
-# Basic usage (same as original)
-./target/release/read-bench-refactored --concurrency 16 --duration 60
+# Basic usage
+./target/release/read-bench --concurrency 16 --duration 60
 
 # With custom database
-./target/release/read-bench-refactored \
+./target/release/read-bench \
   --db-host 10.0.1.5 \
   --db-port 4000 \
   --db-name mydb \
@@ -168,7 +163,7 @@ cargo build --release
   --duration 120
 
 # Full options
-./target/release/read-bench-refactored \
+./target/release/read-bench \
   --concurrency 16 \
   --duration 60 \
   --sample-size 2000 \
@@ -199,29 +194,22 @@ cargo build --release
 - [x] Error handling improved
 - [x] Performance optimized
 
-## Migration Guide
+## Migration Status
 
-### Option 1: Replace Original
+✅ **Migration Complete!**
+
+The refactored version has replaced the original `src/read_bench.rs`.
+
+- **Current version**: Refactored version (optimized, better organized)
+- **Backup**: Original version saved as `src/read_bench_old_backup.rs`
+- **Binary name**: `read-bench` (unchanged)
+
+### Rollback (if needed)
 ```bash
-mv src/read_bench.rs src/read_bench_old.rs
-mv src/read_bench_refactored.rs src/read_bench.rs
-```
-
-### Option 2: Run Both (Recommended for testing)
-```bash
-# Keep both versions in Cargo.toml
-[[bin]]
-name = "read-bench"
-path = "src/read_bench.rs"
-
-[[bin]]
-name = "read-bench-refactored"
-path = "src/read_bench_refactored.rs"
-
-# Compare results
-./target/release/read-bench --duration 30 > old_results.txt
-./target/release/read-bench-refactored --duration 30 > new_results.txt
-diff old_results.txt new_results.txt
+# Restore original version
+mv src/read_bench.rs src/read_bench_refactored.rs
+mv src/read_bench_old_backup.rs src/read_bench.rs
+cargo build --release
 ```
 
 ## Future Improvements

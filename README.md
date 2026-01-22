@@ -75,13 +75,19 @@ in-memory samples by passing `--use-random-data true`.
 
 ## Read Benchmark (read-bench)
 
-The read benchmark tests query performance using `fts_match_word` function, comparing TiDB and TiFlash execution engines.
+The read benchmark compares query performance between TiDB and TiFlash execution engines:
+- **TiDB**: Uses `fts_match_word()` with FULLTEXT index for fast text search
+- **TiFlash**: Uses `LIKE` pattern matching with columnar storage optimization
 
-It will:
-- Automatically find the table with the latest timestamp (matching `wiki_paragraphs_embeddings_*`)
-- Sample test data (title, text) from the table
-- Run queries using `fts_match_word` on both TiDB and TiFlash
-- Output performance statistics including QPS, p50, p95, p99 latencies
+Features:
+- Automatically finds the table with the latest timestamp (matching `wiki_paragraphs_embeddings_*`)
+- Creates TiFlash replica if missing and waits for sync
+- Samples test data (title, text) from the table
+- Runs optimized queries on both engines:
+  - TiDB: `fts_match_word()` with FULLTEXT index
+  - TiFlash: `LIKE` pattern matching (columnar scan)
+- Outputs performance statistics: QPS, p50, p95, p99 latencies
+- Logs all SQL queries to file for analysis
 
 ```bash
 # Run read benchmark with default settings
