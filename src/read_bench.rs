@@ -713,6 +713,7 @@ fn extract_search_word(
 async fn run_benchmark_worker(
     executor: Arc<QueryExecutor>,
     sample_data: Arc<Vec<SampleData>>,
+    rare_words: Arc<RareWordPool>,
     start_time: Instant,
     duration: Duration,
     engine: QueryEngine,
@@ -722,7 +723,7 @@ async fn run_benchmark_worker(
     let mut stats = ThreadStats::new();
 
     while start_time.elapsed() < duration {
-        let Some(search_query) = extract_search_word(&mut rng, &sample_data, None) else {
+        let Some(search_query) = extract_search_word(&mut rng, &sample_data, Some(&rare_words)) else {
             continue;
         };
 
@@ -1009,11 +1010,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for _ in 0..args.concurrency {
         let executor = executor.clone();
-        let sample_data = sample_data.clone();
+            let sample_data = sample_data.clone();
+            let rare_words = rare_words.clone();
         let verbose = args.verbose;
 
         let handle = tokio::spawn(async move {
-            run_benchmark_worker(executor, sample_data, tidb_start, duration, QueryEngine::TiDB, verbose).await
+                run_benchmark_worker(executor, sample_data, rare_words, tidb_start, duration, QueryEngine::TiDB, verbose).await
         });
 
         tidb_handles.push(handle);
@@ -1033,11 +1035,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for _ in 0..args.concurrency {
         let executor = executor.clone();
-        let sample_data = sample_data.clone();
+            let sample_data = sample_data.clone();
+            let rare_words = rare_words.clone();
         let verbose = args.verbose;
 
         let handle = tokio::spawn(async move {
-            run_benchmark_worker(executor, sample_data, tikv_start, duration, QueryEngine::TiKV, verbose).await
+                run_benchmark_worker(executor, sample_data, rare_words, tikv_start, duration, QueryEngine::TiKV, verbose).await
         });
 
         tikv_handles.push(handle);
@@ -1057,11 +1060,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for _ in 0..args.concurrency {
         let executor = executor.clone();
-        let sample_data = sample_data.clone();
+            let sample_data = sample_data.clone();
+            let rare_words = rare_words.clone();
         let verbose = args.verbose;
 
         let handle = tokio::spawn(async move {
-            run_benchmark_worker(executor, sample_data, tiflash_start, duration, QueryEngine::TiFlash, verbose).await
+                run_benchmark_worker(executor, sample_data, rare_words, tiflash_start, duration, QueryEngine::TiFlash, verbose).await
         });
 
         tiflash_handles.push(handle);
