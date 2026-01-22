@@ -50,6 +50,7 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use sqlx::mysql::{MySqlPoolOptions, MySqlConnectOptions};
 use sqlx::{Pool, MySql};
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -369,13 +370,14 @@ async fn run_query_tiflash(
     Ok(duration)
 }
 
-/// Check if TiFlash replica exists for the table
+/// Check if TiFlash replica exists for the table, create if missing and wait for sync
 async fn check_tiflash_replica(pool: &Pool<MySql>, table_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let query = r#"
         SELECT 
             table_schema,
             table_name,
-            is_tiflash_replica
+            is_tiflash_replica,
+            progress
         FROM information_schema.tiflash_replica
         WHERE table_schema = 'test' AND table_name = ?
     "#;
@@ -385,6 +387,7 @@ async fn check_tiflash_replica(pool: &Pool<MySql>, table_name: &str) -> Result<(
         table_schema: String,
         table_name: String,
         is_tiflash_replica: u8,
+        progress: Option<f64>,
     }
     
     let result: Option<ReplicaInfo> = sqlx::query_as(query)
@@ -394,22 +397,115 @@ async fn check_tiflash_replica(pool: &Pool<MySql>, table_name: &str) -> Result<(
     
     match result {
         Some(info) => {
+            // Check if replica is available and synced
             if info.is_tiflash_replica == 1 {
-                println!("✓ TiFlash replica exists for table: {}", table_name);
-            } else {
-                eprintln!("⚠ Warning: TiFlash replica not available for table: {}", table_name);
-                eprintln!("  Query hint may be ignored. Please create TiFlash replica first:");
-                eprintln!("  ALTER TABLE `{}` SET TIFLASH REPLICA 1;", table_name);
+                if let Some(progress) = info.progress {
+                    if progress >= 1.0 {
+                        println!("✓ TiFlash replica exists and is synced for table: {} (progress: {:.2}%)", 
+                            table_name, progress * 100.0);
+                        return Ok(());
+                    } else {
+                        println!("⏳ TiFlash replica exists but not fully synced (progress: {:.2}%), waiting...", 
+                            progress * 100.0);
+                        // Wait for sync to complete
+                        wait_for_tiflash_sync(pool, table_name).await?;
+                        return Ok(());
+                    }
+                } else {
+                    println!("✓ TiFlash replica exists for table: {}", table_name);
+                    return Ok(());
+                }
             }
         }
         None => {
-            eprintln!("⚠ Warning: No TiFlash replica found for table: {}", table_name);
-            eprintln!("  Query hint may be ignored. Please create TiFlash replica first:");
-            eprintln!("  ALTER TABLE `{}` SET TIFLASH REPLICA 1;", table_name);
+            // No replica found, need to create
         }
     }
     
+    // TiFlash replica doesn't exist or not available, create it
+    println!("> Creating TiFlash replica for table: {}", table_name);
+    let alter_sql = format!("ALTER TABLE `{}` SET TIFLASH REPLICA 1", table_name);
+    
+    match sqlx::query(&alter_sql).execute(pool).await {
+        Ok(_) => {
+            println!("✓ TiFlash replica creation command executed successfully");
+        }
+        Err(e) => {
+            return Err(format!("❌ Failed to create TiFlash replica: {}. Please ensure TiFlash cluster is running and accessible.", e).into());
+        }
+    }
+    
+    // Wait for replica to be created and synced
+    println!("> Waiting for TiFlash replica to sync...");
+    wait_for_tiflash_sync(pool, table_name).await?;
+    
     Ok(())
+}
+
+/// Wait for TiFlash replica to be fully synced
+async fn wait_for_tiflash_sync(pool: &Pool<MySql>, table_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let max_wait_seconds = 300; // Maximum 5 minutes
+    let check_interval = Duration::from_secs(2);
+    let start = Instant::now();
+    
+    loop {
+        let query = r#"
+            SELECT 
+                is_tiflash_replica,
+                progress
+            FROM information_schema.tiflash_replica
+            WHERE table_schema = 'test' AND table_name = ?
+        "#;
+        
+        #[derive(sqlx::FromRow)]
+        struct SyncInfo {
+            is_tiflash_replica: u8,
+            progress: Option<f64>,
+        }
+        
+        let result: Option<SyncInfo> = sqlx::query_as(query)
+            .bind(table_name)
+            .fetch_optional(pool)
+            .await?;
+        
+        match result {
+            Some(info) => {
+                if info.is_tiflash_replica == 1 {
+                    if let Some(progress) = info.progress {
+                        if progress >= 1.0 {
+                            println!("✓ TiFlash replica is fully synced (progress: {:.2}%)", progress * 100.0);
+                            return Ok(());
+                        } else {
+                            print!("\r⏳ Syncing TiFlash replica... {:.1}%", progress * 100.0);
+                            io::stdout().flush().ok();
+                        }
+                    } else {
+                        // Progress not available, but replica exists, assume it's ready
+                        println!("\n✓ TiFlash replica is available");
+                        return Ok(());
+                    }
+                } else {
+                    // Replica not available yet
+                    print!("\r⏳ Waiting for TiFlash replica to be created...");
+                    io::stdout().flush().ok();
+                }
+            }
+            None => {
+                // Replica not found yet
+                print!("\r⏳ Waiting for TiFlash replica to be created...");
+                io::stdout().flush().ok();
+            }
+        }
+        
+        if start.elapsed().as_secs() > max_wait_seconds {
+            return Err(format!(
+                "❌ Timeout: TiFlash replica for table '{}' did not sync within {} seconds. Please check TiFlash cluster status.",
+                table_name, max_wait_seconds
+            ).into());
+        }
+        
+        tokio::time::sleep(check_interval).await;
+    }
 }
 
 /// Verify that query actually executes on TiFlash by checking EXPLAIN plan
