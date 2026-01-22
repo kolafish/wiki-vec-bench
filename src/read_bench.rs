@@ -446,28 +446,27 @@ async fn run_query_tidb(
     output_file: &Arc<Mutex<std::fs::File>>,
 ) -> Result<Duration, sqlx::Error> {
     let start = Instant::now();
+    
+    // Escape single quotes in search_word to prevent SQL injection
+    let escaped_word = search_word.replace("'", "''");
+    
+    // Build query with literal string (not placeholder) because TiDB fts_match_word requires constant
     let query = format!(
         r#"
         SELECT count(*) 
         FROM `{}` 
-        WHERE fts_match_word(?, text) OR fts_match_word(?, title)
+        WHERE fts_match_word('{}', text) OR fts_match_word('{}', title)
         "#,
-        table_name
+        table_name, escaped_word, escaped_word
     );
     
     // Log SQL query to file
-    let sql_with_values = format!(
-        "SELECT count(*) FROM `{}` WHERE fts_match_word('{}', text) OR fts_match_word('{}', title);\n",
-        table_name, search_word, search_word
-    );
     if let Ok(mut file) = output_file.lock() {
         let _ = writeln!(file, "-- TiDB Query");
-        let _ = writeln!(file, "{}", sql_with_values);
+        let _ = writeln!(file, "{}", query.trim());
     }
     
     let count: i64 = sqlx::query_scalar(&query)
-        .bind(search_word)
-        .bind(search_word)
         .fetch_one(pool)
         .await?;
     
@@ -476,7 +475,7 @@ async fn run_query_tidb(
     if verbose {
         println!("---------------------------------------------------");
         println!("[TiDB] Time: {:?} | Count: {} | Word: '{}'", duration.as_millis(), count, search_word);
-        println!("SQL: {}", sql_with_values.trim());
+        println!("SQL: {}", query.trim());
     }
     
     Ok(duration)
@@ -490,31 +489,30 @@ async fn run_query_tiflash(
     output_file: &Arc<Mutex<std::fs::File>>,
 ) -> Result<Duration, sqlx::Error> {
     let start = Instant::now();
+    
+    // Escape single quotes in search_word to prevent SQL injection
+    let escaped_word = search_word.replace("'", "''");
+    
     // Use TiFlash by SQL hint: READ_FROM_STORAGE(TIFLASH[table])
     // This hint forces TiDB optimizer to read from TiFlash replica
     // TiFlash uses columnar storage and MPP (Massively Parallel Processing) architecture
+    // Build query with literal string (not placeholder) because TiDB fts_match_word requires constant
     let query = format!(
         r#"
         SELECT /*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */ count(*) 
         FROM `{}` 
-        WHERE fts_match_word(title, ?) OR fts_match_word(text, ?)
+        WHERE fts_match_word('{}', text) OR fts_match_word('{}', title)
         "#,
-        table_name, table_name
+        table_name, table_name, escaped_word, escaped_word
     );
     
     // Log SQL query to file
-    let sql_with_values = format!(
-        "SELECT /*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */ count(*) FROM `{}` WHERE fts_match_word(title, '{}') OR fts_match_word(text, '{}');\n",
-        table_name, table_name, search_word, search_word
-    );
     if let Ok(mut file) = output_file.lock() {
         let _ = writeln!(file, "-- TiFlash Query");
-        let _ = writeln!(file, "{}", sql_with_values);
+        let _ = writeln!(file, "{}", query.trim());
     }
     
     let count: i64 = sqlx::query_scalar(&query)
-        .bind(search_word)
-        .bind(search_word)
         .fetch_one(pool)
         .await?;
     
@@ -523,7 +521,7 @@ async fn run_query_tiflash(
     if verbose {
         println!("---------------------------------------------------");
         println!("[TiFlash] Time: {:?} | Count: {} | Word: '{}'", duration.as_millis(), count, search_word);
-        println!("SQL: {}", sql_with_values.trim());
+        println!("SQL: {}", query.trim());
     }
     
     Ok(duration)
