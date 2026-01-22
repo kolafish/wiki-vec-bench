@@ -171,12 +171,6 @@ impl RareWordPool {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum QueryType {
-    Simple,
-    Complex,
-}
-
-#[derive(Clone, Copy, Debug)]
 enum ComplexQueryVariant {
     WithMetadataFilter,  // Filter by views and langs
     GroupByLangs,        // Aggregate by langs

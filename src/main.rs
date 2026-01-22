@@ -12,7 +12,7 @@ use std::fs::File;
 use std::path::Path;
 use std::process::Command;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use arrow_array::{ArrayRef, StringArray, ListArray, Float32Array, Float64Array, Int32Array, Int64Array};
+use arrow_array::{Array, ArrayRef, StringArray, ListArray, Float32Array, Float64Array, Int32Array, Int64Array};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "TiDB OLTP benchmark for wiki_paragraphs_embeddings")]
