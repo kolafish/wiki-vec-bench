@@ -63,6 +63,10 @@ struct Args {
     /// Database name
     #[arg(long, default_value = DEFAULT_DB_NAME)]
     db_name: String,
+
+    /// Enable complex query benchmark
+    #[arg(long, default_value_t = false)]
+    complex_queries: bool,
 }
 
 // ============================================================================
@@ -73,6 +77,9 @@ struct ThreadStats {
     tidb_latencies: Vec<u128>,
     tikv_latencies: Vec<u128>,
     tiflash_latencies: Vec<u128>,
+    tidb_complex_latencies: Vec<u128>,
+    tikv_complex_latencies: Vec<u128>,
+    tiflash_complex_latencies: Vec<u128>,
     errors: usize,
 }
 
@@ -82,6 +89,9 @@ impl ThreadStats {
             tidb_latencies: Vec::with_capacity(4096),
             tikv_latencies: Vec::with_capacity(4096),
             tiflash_latencies: Vec::with_capacity(4096),
+            tidb_complex_latencies: Vec::with_capacity(4096),
+            tikv_complex_latencies: Vec::with_capacity(4096),
+            tiflash_complex_latencies: Vec::with_capacity(4096),
             errors: 0,
         }
     }
@@ -90,6 +100,9 @@ impl ThreadStats {
         self.tidb_latencies.extend(other.tidb_latencies);
         self.tikv_latencies.extend(other.tikv_latencies);
         self.tiflash_latencies.extend(other.tiflash_latencies);
+        self.tidb_complex_latencies.extend(other.tidb_complex_latencies);
+        self.tikv_complex_latencies.extend(other.tikv_complex_latencies);
+        self.tiflash_complex_latencies.extend(other.tiflash_complex_latencies);
         self.errors += other.errors;
     }
 }
@@ -135,6 +148,19 @@ impl FieldType {
 struct SearchQuery {
     word: String,
     field: FieldType,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum QueryType {
+    Simple,
+    Complex,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ComplexQueryVariant {
+    WithMetadataFilter,  // Filter by views and langs
+    GroupByLangs,        // Aggregate by langs
+    TopNByViews,         // TOP-N ordered by views
 }
 
 // ============================================================================
@@ -223,6 +249,78 @@ impl QueryBuilder {
         }
     }
 
+    /// Build complex query with metadata filtering and aggregations
+    fn build_complex_query(
+        &self, 
+        search_word: &str, 
+        field: FieldType, 
+        engine: QueryEngine,
+        variant: ComplexQueryVariant,
+    ) -> String {
+        let escaped_word = Self::escape_sql_string(search_word);
+        let field_name = field.name();
+        
+        let storage_hint = match engine {
+            QueryEngine::TiDB => String::new(),
+            QueryEngine::TiKV => format!("/*+ READ_FROM_STORAGE(TIKV[`{}`]) */", self.table_name),
+            QueryEngine::TiFlash => format!("/*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */", self.table_name),
+        };
+        
+        match variant {
+            ComplexQueryVariant::WithMetadataFilter => {
+                // Filter by metadata: search + views > 1000 + langs >= 2
+                match engine {
+                    QueryEngine::TiDB => {
+                        format!(
+                            "SELECT count(*) FROM `{}` WHERE fts_match_word('{}', {}) AND views > 1000 AND langs >= 2",
+                            self.table_name, escaped_word, field_name
+                        )
+                    }
+                    _ => {
+                        format!(
+                            "SELECT {} count(*) FROM `{}` WHERE {} LIKE '%{}%' AND views > 1000 AND langs >= 2",
+                            storage_hint, self.table_name, field_name, escaped_word
+                        )
+                    }
+                }
+            }
+            ComplexQueryVariant::GroupByLangs => {
+                // GROUP BY langs with count aggregation
+                match engine {
+                    QueryEngine::TiDB => {
+                        format!(
+                            "SELECT langs, count(*) as cnt FROM `{}` WHERE fts_match_word('{}', {}) GROUP BY langs ORDER BY cnt DESC LIMIT 10",
+                            self.table_name, escaped_word, field_name
+                        )
+                    }
+                    _ => {
+                        format!(
+                            "SELECT {} langs, count(*) as cnt FROM `{}` WHERE {} LIKE '%{}%' GROUP BY langs ORDER BY cnt DESC LIMIT 10",
+                            storage_hint, self.table_name, field_name, escaped_word
+                        )
+                    }
+                }
+            }
+            ComplexQueryVariant::TopNByViews => {
+                // TOP-N query ordered by views
+                match engine {
+                    QueryEngine::TiDB => {
+                        format!(
+                            "SELECT id, title, views FROM `{}` WHERE fts_match_word('{}', {}) ORDER BY views DESC LIMIT 10",
+                            self.table_name, escaped_word, field_name
+                        )
+                    }
+                    _ => {
+                        format!(
+                            "SELECT {} id, title, views FROM `{}` WHERE {} LIKE '%{}%' ORDER BY views DESC LIMIT 10",
+                            storage_hint, self.table_name, field_name, escaped_word
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     /// Escape SQL string to prevent injection
     /// Also escapes LIKE wildcards to prevent unintended pattern matching
     fn escape_sql_string(s: &str) -> String {
@@ -276,6 +374,36 @@ impl QueryExecutor {
             println!("---------------------------------------------------");
             println!("[{}] Time: {:?} | Count: {} | Field: {} | Word: '{}'", 
                 engine.name(), duration.as_millis(), count, field.name(), search_word);
+            println!("SQL: {}", query);
+        }
+
+        Ok(duration)
+    }
+
+    async fn execute_complex_query(
+        &self,
+        search_word: &str,
+        field: FieldType,
+        engine: QueryEngine,
+        variant: ComplexQueryVariant,
+        verbose: bool,
+    ) -> Result<Duration, sqlx::Error> {
+        let query = self.query_builder.build_complex_query(search_word, field, engine, variant);
+        
+        let start = Instant::now();
+        // Execute query but ignore results (we only care about execution time)
+        let _rows = sqlx::query(&query)
+            .fetch_all(&self.pool)
+            .await?;
+        let duration = start.elapsed();
+
+        // Log to file with execution time
+        self.logger.log_query(engine, &query, duration);
+
+        if verbose {
+            println!("---------------------------------------------------");
+            println!("[{} COMPLEX] Time: {:?} | Field: {} | Word: '{}' | Variant: {:?}", 
+                engine.name(), duration.as_millis(), field.name(), search_word, variant);
             println!("SQL: {}", query);
         }
 
@@ -570,6 +698,66 @@ async fn run_benchmark_worker(
     stats
 }
 
+async fn run_complex_benchmark_worker(
+    executor: Arc<QueryExecutor>,
+    sample_data: Arc<Vec<SampleData>>,
+    start_time: Instant,
+    duration: Duration,
+    engine: QueryEngine,
+    verbose: bool,
+) -> ThreadStats {
+    let mut rng = StdRng::from_entropy();
+    let mut stats = ThreadStats::new();
+
+    // Cycle through different complex query variants
+    let variants = [
+        ComplexQueryVariant::WithMetadataFilter,
+        ComplexQueryVariant::GroupByLangs,
+        ComplexQueryVariant::TopNByViews,
+    ];
+
+    while start_time.elapsed() < duration {
+        let Some(search_query) = extract_search_word(&mut rng, &sample_data) else {
+            continue;
+        };
+
+        // Randomly pick a complex query variant
+        let variant = variants[rng.gen_range(0..variants.len())];
+
+        match engine {
+            QueryEngine::TiDB => {
+                match executor.execute_complex_query(&search_query.word, search_query.field, QueryEngine::TiDB, variant, verbose).await {
+                    Ok(dur) => stats.tidb_complex_latencies.push(dur.as_micros()),
+                    Err(e) => {
+                        eprintln!("TiDB complex query error: {}", e);
+                        stats.errors += 1;
+                    }
+                }
+            }
+            QueryEngine::TiKV => {
+                match executor.execute_complex_query(&search_query.word, search_query.field, QueryEngine::TiKV, variant, verbose).await {
+                    Ok(dur) => stats.tikv_complex_latencies.push(dur.as_micros()),
+                    Err(e) => {
+                        eprintln!("TiKV complex query error: {}", e);
+                        stats.errors += 1;
+                    }
+                }
+            }
+            QueryEngine::TiFlash => {
+                match executor.execute_complex_query(&search_query.word, search_query.field, QueryEngine::TiFlash, variant, verbose).await {
+                    Ok(dur) => stats.tiflash_complex_latencies.push(dur.as_micros()),
+                    Err(e) => {
+                        eprintln!("TiFlash complex query error: {}", e);
+                        stats.errors += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    stats
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -698,11 +886,101 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tiflash_elapsed = tiflash_start.elapsed();
     println!("✓ TiFlash benchmark completed in {:.2?}\n", tiflash_elapsed);
 
+    // Complex queries benchmark (if enabled)
+    let (tidb_complex_elapsed, tikv_complex_elapsed, tiflash_complex_elapsed) = if args.complex_queries {
+        println!("\n========================================");
+        println!("=== COMPLEX QUERIES BENCHMARK ===");
+        println!("========================================\n");
+
+        // Phase 4: Complex TiDB queries
+        println!("=== Phase 4: Benchmarking TiDB (Complex Queries) ===");
+        let tidb_complex_start = Instant::now();
+        let mut tidb_complex_handles = Vec::with_capacity(args.concurrency);
+
+        for _ in 0..args.concurrency {
+            let executor = executor.clone();
+            let sample_data = sample_data.clone();
+            let verbose = args.verbose;
+
+            let handle = tokio::spawn(async move {
+                run_complex_benchmark_worker(executor, sample_data, tidb_complex_start, duration, QueryEngine::TiDB, verbose).await
+            });
+
+            tidb_complex_handles.push(handle);
+        }
+
+        let mut tidb_complex_stats = ThreadStats::new();
+        for handle in tidb_complex_handles {
+            tidb_complex_stats.merge(handle.await?);
+        }
+        let tidb_complex_elapsed = tidb_complex_start.elapsed();
+        println!("✓ TiDB complex queries completed in {:.2?}\n", tidb_complex_elapsed);
+
+        // Phase 5: Complex TiKV queries
+        println!("=== Phase 5: Benchmarking TiKV (Complex Queries) ===");
+        let tikv_complex_start = Instant::now();
+        let mut tikv_complex_handles = Vec::with_capacity(args.concurrency);
+
+        for _ in 0..args.concurrency {
+            let executor = executor.clone();
+            let sample_data = sample_data.clone();
+            let verbose = args.verbose;
+
+            let handle = tokio::spawn(async move {
+                run_complex_benchmark_worker(executor, sample_data, tikv_complex_start, duration, QueryEngine::TiKV, verbose).await
+            });
+
+            tikv_complex_handles.push(handle);
+        }
+
+        let mut tikv_complex_stats = ThreadStats::new();
+        for handle in tikv_complex_handles {
+            tikv_complex_stats.merge(handle.await?);
+        }
+        let tikv_complex_elapsed = tikv_complex_start.elapsed();
+        println!("✓ TiKV complex queries completed in {:.2?}\n", tikv_complex_elapsed);
+
+        // Phase 6: Complex TiFlash queries
+        println!("=== Phase 6: Benchmarking TiFlash (Complex Queries) ===");
+        let tiflash_complex_start = Instant::now();
+        let mut tiflash_complex_handles = Vec::with_capacity(args.concurrency);
+
+        for _ in 0..args.concurrency {
+            let executor = executor.clone();
+            let sample_data = sample_data.clone();
+            let verbose = args.verbose;
+
+            let handle = tokio::spawn(async move {
+                run_complex_benchmark_worker(executor, sample_data, tiflash_complex_start, duration, QueryEngine::TiFlash, verbose).await
+            });
+
+            tiflash_complex_handles.push(handle);
+        }
+
+        let mut tiflash_complex_stats = ThreadStats::new();
+        for handle in tiflash_complex_handles {
+            tiflash_complex_stats.merge(handle.await?);
+        }
+        let tiflash_complex_elapsed = tiflash_complex_start.elapsed();
+        println!("✓ TiFlash complex queries completed in {:.2?}\n", tiflash_complex_elapsed);
+
+        tidb_stats.tidb_complex_latencies = tidb_complex_stats.tidb_complex_latencies;
+        tikv_stats.tikv_complex_latencies = tikv_complex_stats.tikv_complex_latencies;
+        tiflash_stats.tiflash_complex_latencies = tiflash_complex_stats.tiflash_complex_latencies;
+
+        (tidb_complex_elapsed, tikv_complex_elapsed, tiflash_complex_elapsed)
+    } else {
+        (Duration::ZERO, Duration::ZERO, Duration::ZERO)
+    };
+
     // Combine stats for final reporting
     let mut combined_stats = ThreadStats::new();
     combined_stats.tidb_latencies = tidb_stats.tidb_latencies;
     combined_stats.tikv_latencies = tikv_stats.tikv_latencies;
     combined_stats.tiflash_latencies = tiflash_stats.tiflash_latencies;
+    combined_stats.tidb_complex_latencies = tidb_stats.tidb_complex_latencies;
+    combined_stats.tikv_complex_latencies = tikv_stats.tikv_complex_latencies;
+    combined_stats.tiflash_complex_latencies = tiflash_stats.tiflash_complex_latencies;
     combined_stats.errors = tidb_stats.errors + tikv_stats.errors + tiflash_stats.errors;
 
     let total_elapsed = tidb_elapsed + tikv_elapsed + tiflash_elapsed;
@@ -715,6 +993,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Total elapsed  : {:.2?}", total_elapsed);
     println!("Total errors   : {}\n", combined_stats.errors);
 
+    println!("--- Simple Queries ---");
     print_statistics("TiDB", &mut combined_stats.tidb_latencies, tidb_elapsed);
     println!();
     print_statistics("TiKV", &mut combined_stats.tikv_latencies, tikv_elapsed);
@@ -728,13 +1007,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tidb_qps = combined_stats.tidb_latencies.len() as f64 / tidb_elapsed.as_secs_f64();
         let tikv_qps = combined_stats.tikv_latencies.len() as f64 / tikv_elapsed.as_secs_f64();
         let tiflash_qps = combined_stats.tiflash_latencies.len() as f64 / tiflash_elapsed.as_secs_f64();
-        println!("\n--- Comparison ---");
+        println!("\n--- Simple Query Comparison ---");
         println!("TiDB   QPS: {:.2}", tidb_qps);
         println!("TiKV   QPS: {:.2}", tikv_qps);
         println!("TiFlash QPS: {:.2}", tiflash_qps);
         println!("QPS ratio (TiKV/TiDB): {:.2}x", tikv_qps / tidb_qps);
         println!("QPS ratio (TiFlash/TiDB): {:.2}x", tiflash_qps / tidb_qps);
         println!("QPS ratio (TiFlash/TiKV): {:.2}x", tiflash_qps / tikv_qps);
+    }
+
+    // Print complex query statistics if enabled
+    if args.complex_queries {
+        println!("\n--- Complex Queries ---");
+        print_statistics("TiDB (Complex)", &mut combined_stats.tidb_complex_latencies, tidb_complex_elapsed);
+        println!();
+        print_statistics("TiKV (Complex)", &mut combined_stats.tikv_complex_latencies, tikv_complex_elapsed);
+        println!();
+        print_statistics("TiFlash (Complex)", &mut combined_stats.tiflash_complex_latencies, tiflash_complex_elapsed);
+
+        if !combined_stats.tidb_complex_latencies.is_empty() 
+            && !combined_stats.tikv_complex_latencies.is_empty() 
+            && !combined_stats.tiflash_complex_latencies.is_empty() {
+            let tidb_complex_qps = combined_stats.tidb_complex_latencies.len() as f64 / tidb_complex_elapsed.as_secs_f64();
+            let tikv_complex_qps = combined_stats.tikv_complex_latencies.len() as f64 / tikv_complex_elapsed.as_secs_f64();
+            let tiflash_complex_qps = combined_stats.tiflash_complex_latencies.len() as f64 / tiflash_complex_elapsed.as_secs_f64();
+            println!("\n--- Complex Query Comparison ---");
+            println!("TiDB (Complex)   QPS: {:.2}", tidb_complex_qps);
+            println!("TiKV (Complex)   QPS: {:.2}", tikv_complex_qps);
+            println!("TiFlash (Complex) QPS: {:.2}", tiflash_complex_qps);
+            println!("QPS ratio (TiKV/TiDB): {:.2}x", tikv_complex_qps / tidb_complex_qps);
+            println!("QPS ratio (TiFlash/TiDB): {:.2}x", tiflash_complex_qps / tidb_complex_qps);
+            println!("QPS ratio (TiFlash/TiKV): {:.2}x", tiflash_complex_qps / tikv_complex_qps);
+        }
     }
 
     logger.flush()?;
