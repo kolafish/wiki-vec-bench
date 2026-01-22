@@ -547,7 +547,7 @@ async fn check_tiflash_replica(pool: &Pool<MySql>, table_name: &str) -> Result<(
         table_schema: String,
         table_name: String,
         replica_count: Option<i64>,
-        available: Option<u8>,
+        available: Option<bool>,
         progress: Option<f64>,
     }
     
@@ -562,7 +562,7 @@ async fn check_tiflash_replica(pool: &Pool<MySql>, table_name: &str) -> Result<(
             if let Some(replica_count) = info.replica_count {
                 if replica_count > 0 {
                     if let Some(available) = info.available {
-                        if available == 1 {
+                        if available {
                             if let Some(progress) = info.progress {
                                 if progress >= 1.0 {
                                     println!("✓ TiFlash replica exists and is synced for table: {} (progress: {:.2}%)", 
@@ -638,7 +638,7 @@ async fn wait_for_tiflash_sync(pool: &Pool<MySql>, table_name: &str) -> Result<(
         #[derive(sqlx::FromRow)]
         struct SyncInfo {
             replica_count: Option<i64>,
-            available: Option<u8>,
+            available: Option<bool>,
             progress: Option<f64>,
         }
         
@@ -652,7 +652,7 @@ async fn wait_for_tiflash_sync(pool: &Pool<MySql>, table_name: &str) -> Result<(
                 if let Some(replica_count) = info.replica_count {
                     if replica_count > 0 {
                         if let Some(available) = info.available {
-                            if available == 1 {
+                            if available {
                                 if let Some(progress) = info.progress {
                                     if progress >= 1.0 {
                                         println!("\n✓ TiFlash replica is fully synced (progress: {:.2}%)", progress * 100.0);
