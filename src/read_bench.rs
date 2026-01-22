@@ -725,7 +725,7 @@ async fn verify_tiflash_query(pool: &Pool<MySql>, table_name: &str) -> Result<()
         r#"
         EXPLAIN SELECT /*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */ count(*) 
         FROM `{}` 
-        WHERE fts_match_word(title, 'test') OR fts_match_word(text, 'test')
+        WHERE fts_match_word('test', title) OR fts_match_word('test', text)
         "#,
         table_name, table_name
     );
