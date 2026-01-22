@@ -500,8 +500,8 @@ async fn fetch_sample_data(
 fn extract_search_word(rng: &mut impl Rng, sample_data: &[SampleData]) -> Option<SearchQuery> {
     let sample = sample_data.choose(rng)?;
     
-    // Randomly choose between title and text field
-    let (field, text) = if rng.gen_bool(0.5) {
+    // Randomly choose between title and text field (75% title, 25% text)
+    let (field, text) = if rng.gen_bool(0.75) {
         (FieldType::Title, &sample.title)
     } else {
         (FieldType::Text, &sample.text)
