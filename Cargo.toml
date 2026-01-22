@@ -7,10 +7,6 @@ edition = "2021"
 name = "read-bench"
 path = "src/read_bench.rs"
 
-[[bin]]
-name = "read-bench-refactored"
-path = "src/read_bench_refactored.rs"
-
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
