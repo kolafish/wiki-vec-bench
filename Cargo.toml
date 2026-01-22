@@ -10,7 +10,7 @@ path = "src/read_bench.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio", "mysql", "chrono", "derive"] }
+sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio", "mysql", "chrono", "macros"] }
 rand = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 parquet = { version = "52", features = ["arrow"] }

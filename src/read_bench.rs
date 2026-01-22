@@ -3,7 +3,7 @@ use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use sqlx::mysql::{MySqlPoolOptions, MySqlConnectOptions};
-use sqlx::{Pool, MySql, FromRow};
+use sqlx::{Pool, MySql};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,7 +43,7 @@ impl ThreadStats {
     }
 }
 
-#[derive(Clone, Debug, FromRow)]
+#[derive(Clone, Debug, sqlx::FromRow)]
 struct SampleData {
     title: String,
     text: String,
