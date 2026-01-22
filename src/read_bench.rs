@@ -480,6 +480,7 @@ async fn run_benchmark_worker(
     sample_data: Arc<Vec<SampleData>>,
     start_time: Instant,
     duration: Duration,
+    engine: QueryEngine,
     verbose: bool,
 ) -> ThreadStats {
     let mut rng = StdRng::from_entropy();
@@ -490,21 +491,24 @@ async fn run_benchmark_worker(
             continue;
         };
 
-        // Run on TiDB
-        match executor.execute_query(&search_word, QueryEngine::TiDB, verbose).await {
-            Ok(dur) => stats.tidb_latencies.push(dur.as_micros()),
-            Err(e) => {
-                eprintln!("TiDB query error: {}", e);
-                stats.errors += 1;
+        match engine {
+            QueryEngine::TiDB => {
+                match executor.execute_query(&search_word, QueryEngine::TiDB, verbose).await {
+                    Ok(dur) => stats.tidb_latencies.push(dur.as_micros()),
+                    Err(e) => {
+                        eprintln!("TiDB query error: {}", e);
+                        stats.errors += 1;
+                    }
+                }
             }
-        }
-
-        // Run on TiFlash
-        match executor.execute_query(&search_word, QueryEngine::TiFlash, verbose).await {
-            Ok(dur) => stats.tiflash_latencies.push(dur.as_micros()),
-            Err(e) => {
-                eprintln!("TiFlash query error: {}", e);
-                stats.errors += 1;
+            QueryEngine::TiFlash => {
+                match executor.execute_query(&search_word, QueryEngine::TiFlash, verbose).await {
+                    Ok(dur) => stats.tiflash_latencies.push(dur.as_micros()),
+                    Err(e) => {
+                        eprintln!("TiFlash query error: {}", e);
+                        stats.errors += 1;
+                    }
+                }
             }
         }
     }
@@ -564,10 +568,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let executor = Arc::new(QueryExecutor::new(pool.clone(), table_name.clone(), logger.clone()));
     let sample_data = Arc::new(sample_data);
 
-    // Run benchmark
-    let start_time = Instant::now();
+    // Phase 1: Benchmark TiDB
+    println!("=== Phase 1: Benchmarking TiDB ===");
+    let tidb_start = Instant::now();
     let duration = Duration::from_secs(args.duration);
-    let mut handles = Vec::with_capacity(args.concurrency);
+    let mut tidb_handles = Vec::with_capacity(args.concurrency);
 
     for _ in 0..args.concurrency {
         let executor = executor.clone();
@@ -575,33 +580,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let verbose = args.verbose;
 
         let handle = tokio::spawn(async move {
-            run_benchmark_worker(executor, sample_data, start_time, duration, verbose).await
+            run_benchmark_worker(executor, sample_data, tidb_start, duration, QueryEngine::TiDB, verbose).await
         });
 
-        handles.push(handle);
+        tidb_handles.push(handle);
     }
 
-    // Collect results
+    // Collect TiDB results
+    let mut tidb_stats = ThreadStats::new();
+    for handle in tidb_handles {
+        tidb_stats.merge(handle.await?);
+    }
+    let tidb_elapsed = tidb_start.elapsed();
+    println!("✓ TiDB benchmark completed in {:.2?}\n", tidb_elapsed);
+
+    // Phase 2: Benchmark TiFlash
+    println!("=== Phase 2: Benchmarking TiFlash ===");
+    let tiflash_start = Instant::now();
+    let mut tiflash_handles = Vec::with_capacity(args.concurrency);
+
+    for _ in 0..args.concurrency {
+        let executor = executor.clone();
+        let sample_data = sample_data.clone();
+        let verbose = args.verbose;
+
+        let handle = tokio::spawn(async move {
+            run_benchmark_worker(executor, sample_data, tiflash_start, duration, QueryEngine::TiFlash, verbose).await
+        });
+
+        tiflash_handles.push(handle);
+    }
+
+    // Collect TiFlash results
+    let mut tiflash_stats = ThreadStats::new();
+    for handle in tiflash_handles {
+        tiflash_stats.merge(handle.await?);
+    }
+    let tiflash_elapsed = tiflash_start.elapsed();
+    println!("✓ TiFlash benchmark completed in {:.2?}\n", tiflash_elapsed);
+
+    // Combine stats for final reporting
     let mut combined_stats = ThreadStats::new();
-    for handle in handles {
-        combined_stats.merge(handle.await?);
-    }
+    combined_stats.tidb_latencies = tidb_stats.tidb_latencies;
+    combined_stats.tiflash_latencies = tiflash_stats.tiflash_latencies;
+    combined_stats.errors = tidb_stats.errors + tiflash_stats.errors;
 
-    let elapsed = start_time.elapsed();
+    let total_elapsed = tidb_elapsed + tiflash_elapsed;
 
     // Print results
     println!("\n=== Summary ===");
-    println!("Elapsed        : {:.2?}", elapsed);
+    println!("TiDB elapsed   : {:.2?}", tidb_elapsed);
+    println!("TiFlash elapsed: {:.2?}", tiflash_elapsed);
+    println!("Total elapsed  : {:.2?}", total_elapsed);
     println!("Total errors   : {}\n", combined_stats.errors);
 
-    print_statistics("TiDB", &mut combined_stats.tidb_latencies, elapsed);
+    print_statistics("TiDB", &mut combined_stats.tidb_latencies, tidb_elapsed);
     println!();
-    print_statistics("TiFlash", &mut combined_stats.tiflash_latencies, elapsed);
+    print_statistics("TiFlash", &mut combined_stats.tiflash_latencies, tiflash_elapsed);
 
     // Print comparison
     if !combined_stats.tidb_latencies.is_empty() && !combined_stats.tiflash_latencies.is_empty() {
-        let tidb_qps = combined_stats.tidb_latencies.len() as f64 / elapsed.as_secs_f64();
-        let tiflash_qps = combined_stats.tiflash_latencies.len() as f64 / elapsed.as_secs_f64();
+        let tidb_qps = combined_stats.tidb_latencies.len() as f64 / tidb_elapsed.as_secs_f64();
+        let tiflash_qps = combined_stats.tiflash_latencies.len() as f64 / tiflash_elapsed.as_secs_f64();
         println!("\n--- Comparison ---");
         println!("QPS ratio (TiFlash/TiDB): {:.2}x", tiflash_qps / tidb_qps);
     }
