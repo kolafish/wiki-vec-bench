@@ -376,7 +376,8 @@ async fn check_tiflash_replica(pool: &Pool<MySql>, table_name: &str) -> Result<(
         SELECT 
             table_schema,
             table_name,
-            is_tiflash_replica,
+            replica_count,
+            available,
             progress
         FROM information_schema.tiflash_replica
         WHERE table_schema = 'test' AND table_name = ?
@@ -386,7 +387,8 @@ async fn check_tiflash_replica(pool: &Pool<MySql>, table_name: &str) -> Result<(
     struct ReplicaInfo {
         table_schema: String,
         table_name: String,
-        is_tiflash_replica: u8,
+        replica_count: Option<i64>,
+        available: Option<u8>,
         progress: Option<f64>,
     }
     
@@ -397,23 +399,39 @@ async fn check_tiflash_replica(pool: &Pool<MySql>, table_name: &str) -> Result<(
     
     match result {
         Some(info) => {
-            // Check if replica is available and synced
-            if info.is_tiflash_replica == 1 {
-                if let Some(progress) = info.progress {
-                    if progress >= 1.0 {
-                        println!("✓ TiFlash replica exists and is synced for table: {} (progress: {:.2}%)", 
-                            table_name, progress * 100.0);
-                        return Ok(());
+            // Check if replica exists (replica_count > 0) and is available
+            if let Some(replica_count) = info.replica_count {
+                if replica_count > 0 {
+                    if let Some(available) = info.available {
+                        if available == 1 {
+                            if let Some(progress) = info.progress {
+                                if progress >= 1.0 {
+                                    println!("✓ TiFlash replica exists and is synced for table: {} (progress: {:.2}%)", 
+                                        table_name, progress * 100.0);
+                                    return Ok(());
+                                } else {
+                                    println!("⏳ TiFlash replica exists but not fully synced (progress: {:.2}%), waiting...", 
+                                        progress * 100.0);
+                                    // Wait for sync to complete
+                                    wait_for_tiflash_sync(pool, table_name).await?;
+                                    return Ok(());
+                                }
+                            } else {
+                                println!("✓ TiFlash replica exists and is available for table: {}", table_name);
+                                return Ok(());
+                            }
+                        } else {
+                            println!("⏳ TiFlash replica exists but not yet available, waiting...");
+                            // Wait for replica to become available and synced
+                            wait_for_tiflash_sync(pool, table_name).await?;
+                            return Ok(());
+                        }
                     } else {
-                        println!("⏳ TiFlash replica exists but not fully synced (progress: {:.2}%), waiting...", 
-                            progress * 100.0);
+                        println!("✓ TiFlash replica exists for table: {} (replica_count: {})", table_name, replica_count);
                         // Wait for sync to complete
                         wait_for_tiflash_sync(pool, table_name).await?;
                         return Ok(());
                     }
-                } else {
-                    println!("✓ TiFlash replica exists for table: {}", table_name);
-                    return Ok(());
                 }
             }
         }
@@ -451,7 +469,8 @@ async fn wait_for_tiflash_sync(pool: &Pool<MySql>, table_name: &str) -> Result<(
     loop {
         let query = r#"
             SELECT 
-                is_tiflash_replica,
+                replica_count,
+                available,
                 progress
             FROM information_schema.tiflash_replica
             WHERE table_schema = 'test' AND table_name = ?
@@ -459,7 +478,8 @@ async fn wait_for_tiflash_sync(pool: &Pool<MySql>, table_name: &str) -> Result<(
         
         #[derive(sqlx::FromRow)]
         struct SyncInfo {
-            is_tiflash_replica: u8,
+            replica_count: Option<i64>,
+            available: Option<u8>,
             progress: Option<f64>,
         }
         
@@ -470,22 +490,50 @@ async fn wait_for_tiflash_sync(pool: &Pool<MySql>, table_name: &str) -> Result<(
         
         match result {
             Some(info) => {
-                if info.is_tiflash_replica == 1 {
-                    if let Some(progress) = info.progress {
-                        if progress >= 1.0 {
-                            println!("✓ TiFlash replica is fully synced (progress: {:.2}%)", progress * 100.0);
-                            return Ok(());
+                if let Some(replica_count) = info.replica_count {
+                    if replica_count > 0 {
+                        if let Some(available) = info.available {
+                            if available == 1 {
+                                if let Some(progress) = info.progress {
+                                    if progress >= 1.0 {
+                                        println!("\n✓ TiFlash replica is fully synced (progress: {:.2}%)", progress * 100.0);
+                                        return Ok(());
+                                    } else {
+                                        print!("\r⏳ Syncing TiFlash replica... {:.1}%", progress * 100.0);
+                                        io::stdout().flush().ok();
+                                    }
+                                } else {
+                                    // Progress not available, but replica is available, assume it's ready
+                                    println!("\n✓ TiFlash replica is available");
+                                    return Ok(());
+                                }
+                            } else {
+                                // Replica exists but not available yet
+                                print!("\r⏳ Waiting for TiFlash replica to become available...");
+                                io::stdout().flush().ok();
+                            }
                         } else {
-                            print!("\r⏳ Syncing TiFlash replica... {:.1}%", progress * 100.0);
-                            io::stdout().flush().ok();
+                            // Replica exists but availability unknown, check progress
+                            if let Some(progress) = info.progress {
+                                if progress >= 1.0 {
+                                    println!("\n✓ TiFlash replica is fully synced (progress: {:.2}%)", progress * 100.0);
+                                    return Ok(());
+                                } else {
+                                    print!("\r⏳ Syncing TiFlash replica... {:.1}%", progress * 100.0);
+                                    io::stdout().flush().ok();
+                                }
+                            } else {
+                                print!("\r⏳ Waiting for TiFlash replica to sync...");
+                                io::stdout().flush().ok();
+                            }
                         }
                     } else {
-                        // Progress not available, but replica exists, assume it's ready
-                        println!("\n✓ TiFlash replica is available");
-                        return Ok(());
+                        // Replica count is 0, not created yet
+                        print!("\r⏳ Waiting for TiFlash replica to be created...");
+                        io::stdout().flush().ok();
                     }
                 } else {
-                    // Replica not available yet
+                    // Replica count is None or 0
                     print!("\r⏳ Waiting for TiFlash replica to be created...");
                     io::stdout().flush().ok();
                 }
