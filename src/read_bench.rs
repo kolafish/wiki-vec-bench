@@ -490,25 +490,29 @@ async fn run_query_tiflash(
 ) -> Result<Duration, sqlx::Error> {
     let start = Instant::now();
     
-    // Escape single quotes in search_word to prevent SQL injection
-    let escaped_word = search_word.replace("'", "''");
+    // Escape for SQL and LIKE wildcards
+    let escaped_word = search_word
+        .replace("\\", "\\\\")
+        .replace("'", "''")
+        .replace("%", "\\%")
+        .replace("_", "\\_");
     
     // Use TiFlash by SQL hint: READ_FROM_STORAGE(TIFLASH[table])
     // This hint forces TiDB optimizer to read from TiFlash replica
     // TiFlash uses columnar storage and MPP (Massively Parallel Processing) architecture
-    // Build query with literal string (not placeholder) because TiDB fts_match_word requires constant
+    // Note: TiFlash doesn't support fts_match_word, so we use LIKE for string matching
     let query = format!(
         r#"
         SELECT /*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */ count(*) 
         FROM `{}` 
-        WHERE fts_match_word('{}', text) OR fts_match_word('{}', title)
+        WHERE text LIKE '%{}%' OR title LIKE '%{}%'
         "#,
         table_name, table_name, escaped_word, escaped_word
     );
     
     // Log SQL query to file
     if let Ok(mut file) = output_file.lock() {
-        let _ = writeln!(file, "-- TiFlash Query");
+        let _ = writeln!(file, "-- TiFlash Query (using LIKE)");
         let _ = writeln!(file, "{}", query.trim());
     }
     
@@ -720,12 +724,12 @@ async fn verify_tiflash_query(pool: &Pool<MySql>, table_name: &str) -> Result<()
         .execute(pool)
         .await?;
     
-    // Create a test query with hint
+    // Create a test query with hint (using LIKE since TiFlash doesn't support fts_match_word)
     let explain_query = format!(
         r#"
         EXPLAIN SELECT /*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */ count(*) 
         FROM `{}` 
-        WHERE fts_match_word('test', title) OR fts_match_word('test', text)
+        WHERE text LIKE '%test%' OR title LIKE '%test%'
         "#,
         table_name, table_name
     );
