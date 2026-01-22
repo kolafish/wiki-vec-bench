@@ -300,6 +300,9 @@ async fn run_update_mixed(
     }
 
     let target_id = rng.gen_range(1..current_max) as i64;
+    // For composite primary key (id, wiki_id), we need both values
+    // Use target_id as wiki_id for simplicity (same as insert logic)
+    let target_wiki_id = target_id;
     let extra_views: f64 = rng.gen_range(0.0..100.0);
     let sample = pick_sample(rng, samples);
     let new_text = sample.text.clone();
@@ -309,13 +312,13 @@ async fn run_update_mixed(
         r#"
         UPDATE `{table}`
         SET views = COALESCE(views, 0) + ?, text = ?, vector = ?
-        WHERE id = ?
+        WHERE id = ? AND wiki_id = ?
     "#,
         table = table_name
     );
 
     if verbose {
-        println!("UPDATE id={}", target_id);
+        println!("UPDATE id={}, wiki_id={}", target_id, target_wiki_id);
     }
 
     let result = sqlx::query(&sql)
@@ -323,6 +326,7 @@ async fn run_update_mixed(
         .bind(new_text)
         .bind(new_vector)
         .bind(target_id)
+        .bind(target_wiki_id)
         .execute(pool)
         .await?;
 
@@ -384,7 +388,7 @@ async fn create_table_with_index(pool: &Pool<MySql>, build_index: bool) -> Resul
           views         DOUBLE       NULL,
           langs         INT          NULL,
           vector        TEXT         NOT NULL,
-          PRIMARY KEY (id),
+          PRIMARY KEY (id, wiki_id),
           KEY idx_wiki_para (wiki_id, paragraph_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         "#,
