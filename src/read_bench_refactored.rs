@@ -166,26 +166,38 @@ impl QueryBuilder {
     }
 
     /// Build FTS query for specific engine
+    /// TiDB uses fts_match_word (full-text index)
+    /// TiFlash uses LIKE (string matching, as fts_match_word is not supported)
     fn build_fts_query(&self, search_word: &str, engine: QueryEngine) -> String {
         let escaped_word = Self::escape_sql_string(search_word);
         
-        let hint = match engine {
-            QueryEngine::TiDB => String::new(),
-            QueryEngine::TiFlash => format!("/*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */ ", self.table_name),
-        };
-
-        format!(
-            "SELECT {}count(*) FROM `{}` WHERE fts_match_word('{}', text) OR fts_match_word('{}', title)",
-            hint, self.table_name, escaped_word, escaped_word
-        )
+        match engine {
+            QueryEngine::TiDB => {
+                // TiDB: Use fts_match_word with FULLTEXT index
+                format!(
+                    "SELECT count(*) FROM `{}` WHERE fts_match_word('{}', text) OR fts_match_word('{}', title)",
+                    self.table_name, escaped_word, escaped_word
+                )
+            }
+            QueryEngine::TiFlash => {
+                // TiFlash: Use LIKE for string matching (fts_match_word not supported)
+                format!(
+                    "SELECT /*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */ count(*) FROM `{}` WHERE text LIKE '%{}%' OR title LIKE '%{}%'",
+                    self.table_name, self.table_name, escaped_word, escaped_word
+                )
+            }
+        }
     }
 
     /// Escape SQL string to prevent injection
+    /// Also escapes LIKE wildcards to prevent unintended pattern matching
     fn escape_sql_string(s: &str) -> String {
         s.replace('\\', "\\\\")
          .replace('\'', "''")
          .replace('"', "\\\"")
          .replace('\0', "\\0")
+         .replace('%', "\\%")
+         .replace('_', "\\_")
     }
 }
 
@@ -357,11 +369,11 @@ impl TiFlashReplicaManager {
             .execute(&self.pool)
             .await?;
 
-        // Test query
+        // Test query using LIKE (not fts_match_word, as TiFlash doesn't support it)
         let explain_query = format!(
             "EXPLAIN SELECT /*+ READ_FROM_STORAGE(TIFLASH[`{}`]) */ count(*)
              FROM `{}`
-             WHERE fts_match_word('test', title) OR fts_match_word('test', text)",
+             WHERE text LIKE '%test%' OR title LIKE '%test%'",
             table_name, table_name
         );
 
@@ -370,16 +382,19 @@ impl TiFlashReplicaManager {
             task: String,
         }
 
-        let rows: Vec<ExplainRow> = sqlx::query_as(&explain_query)
-            .fetch_all(&self.pool)
-            .await?;
-
-        let found_tiflash = rows.iter().any(|r| r.task.contains("tiflash"));
-
-        if found_tiflash {
-            println!("✓ Query plan verification: TiFlash will be used");
-        } else {
-            eprintln!("⚠ Warning: EXPLAIN plan does not show TiFlash usage");
+        match sqlx::query_as::<_, ExplainRow>(&explain_query).fetch_all(&self.pool).await {
+            Ok(rows) => {
+                let found_tiflash = rows.iter().any(|r| r.task.contains("tiflash"));
+                if found_tiflash {
+                    println!("✓ Query plan verification: TiFlash will be used (with LIKE pattern matching)");
+                } else {
+                    eprintln!("⚠ Warning: EXPLAIN plan does not show TiFlash usage");
+                }
+            }
+            Err(e) => {
+                eprintln!("⚠ Warning: Could not verify TiFlash query plan: {}", e);
+                eprintln!("  Benchmark will continue with fallback behavior");
+            }
         }
 
         Ok(())
