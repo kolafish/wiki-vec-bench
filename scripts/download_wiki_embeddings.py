@@ -24,6 +24,12 @@ def main() -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
 
+    # Clean up any existing parquet files to avoid conflicts with old/corrupted files
+    print("Cleaning up old parquet files...", flush=True)
+    for old_file in raw_dir.glob("*.parquet"):
+        old_file.unlink()
+        print(f"Removed old file: {old_file.name}", flush=True)
+
     print(f"Loading dataset {DATASET_NAME}:{SPLIT} from Hugging Face...", flush=True)
     ds = load_dataset(DATASET_NAME, split=SPLIT)
 

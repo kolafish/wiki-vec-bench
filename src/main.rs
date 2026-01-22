@@ -487,12 +487,36 @@ fn load_samples_from_parquet(
             break;
         }
         println!("loading samples from {:?}", path);
-        let file = File::open(&path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        let mut reader = builder.with_batch_size(1024).build()?;
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("warning: failed to open {:?}: {}, skipping", path, e);
+                continue;
+            }
+        };
+        let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("warning: failed to read parquet file {:?}: {}, skipping", path, e);
+                continue;
+            }
+        };
+        let mut reader = match builder.with_batch_size(1024).build() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("warning: failed to build parquet reader for {:?}: {}, skipping", path, e);
+                continue;
+            }
+        };
 
         while let Some(batch_result) = reader.next() {
-            let batch = batch_result?;
+            let batch = match batch_result {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("warning: failed to read batch from {:?}: {}, skipping remaining batches", path, e);
+                    break;
+                }
+            };
             let schema = batch.schema();
             let title_idx = schema.index_of("title")?;
             let text_idx = schema.index_of("text")?;
