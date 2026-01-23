@@ -6,6 +6,7 @@ use rand::rngs::StdRng;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 use sqlx::{MySql, Pool};
 use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
