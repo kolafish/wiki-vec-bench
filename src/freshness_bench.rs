@@ -61,6 +61,7 @@ struct WriteRecord {
 
 struct ReaderStats {
     lags_ms: Vec<u64>,
+    read_lat_ms: Vec<u64>,
     errors: u64,
     misses: u64,
 }
@@ -69,6 +70,7 @@ impl ReaderStats {
     fn new() -> Self {
         Self {
             lags_ms: Vec::with_capacity(4096),
+            read_lat_ms: Vec::with_capacity(4096),
             errors: 0,
             misses: 0,
         }
@@ -76,6 +78,7 @@ impl ReaderStats {
 
     fn merge(&mut self, other: ReaderStats) {
         self.lags_ms.extend(other.lags_ms);
+        self.read_lat_ms.extend(other.read_lat_ms);
         self.errors += other.errors;
         self.misses += other.misses;
     }
@@ -208,14 +211,22 @@ async fn run_reader(
                 break;
             }
             let query = build_read_query(&table_name, &record.ts_text);
+            let read_start = Instant::now();
             let result: Result<Option<i64>, sqlx::Error> =
                 sqlx::query_scalar(&query).fetch_optional(&pool).await;
+            let read_elapsed = read_start.elapsed();
             match result {
                 Ok(Some(write_ts)) => {
                     let lag = now_ms().saturating_sub(write_ts) as u64;
                     stats.lags_ms.push(lag);
+                    stats.read_lat_ms.push(read_elapsed.as_millis() as u64);
                     if verbose {
-                        println!("read ts={} lag={}ms", write_ts, lag);
+                        println!(
+                            "read ts={} lag={}ms read={}ms",
+                            write_ts,
+                            lag,
+                            read_elapsed.as_millis()
+                        );
                     }
                     break;
                 }
@@ -322,8 +333,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let elapsed = start_time.elapsed();
     let total_reads = combined.lags_ms.len();
-    let p95 = percentile(&mut combined.lags_ms, 0.95);
-    let p99 = percentile(&mut combined.lags_ms, 0.99);
+    let freshness_p95 = percentile(&mut combined.lags_ms, 0.95);
+    let read_p95 = percentile(&mut combined.read_lat_ms, 0.95);
+    let read_p99 = percentile(&mut combined.read_lat_ms, 0.99);
     let write_qps = write_counter.load(Ordering::Relaxed) as f64 / elapsed.as_secs_f64();
 
     println!();
@@ -333,13 +345,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Reads        : {}", total_reads);
     println!("Read errors  : {}", combined.errors);
     println!("Read misses  : {}", combined.misses);
-    match p95 {
+    match read_p95 {
+        Some(v) => println!("Read p95     : {} ms", v),
+        None => println!("Read p95     : n/a"),
+    }
+    match read_p99 {
+        Some(v) => println!("Read p99     : {} ms", v),
+        None => println!("Read p99     : n/a"),
+    }
+    match freshness_p95 {
         Some(v) => println!("Freshness p95: {} ms", v),
         None => println!("Freshness p95: n/a"),
-    }
-    match p99 {
-        Some(v) => println!("Freshness p99: {} ms", v),
-        None => println!("Freshness p99: n/a"),
     }
 
     Ok(())
