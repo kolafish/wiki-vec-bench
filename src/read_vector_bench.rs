@@ -123,7 +123,7 @@ fn escape_sql_string(s: &str) -> String {
 fn build_vector_query(table_name: &str, vector_query: &str) -> String {
     let escaped = escape_sql_string(vector_query);
     format!(
-        "SELECT count(*) FROM `{}` WHERE fts_match_word('{}', vector)",
+        "SELECT id FROM `{}` WHERE fts_match_word('{}', vector)",
         table_name, escaped
     )
 }
@@ -168,18 +168,18 @@ async fn run_worker(
 
         let query = build_vector_query(&table_name, &sample.vector);
         let start = Instant::now();
-        let result: Result<i64, sqlx::Error> = sqlx::query_scalar(&query).fetch_one(&pool).await;
+        let result: Result<Vec<i64>, sqlx::Error> = sqlx::query_scalar(&query).fetch_all(&pool).await;
         let elapsed = start.elapsed();
         logger.log_query(&query, elapsed);
 
         match result {
-            Ok(count) => {
+            Ok(ids) => {
                 stats.latencies.push(elapsed.as_micros());
                 if verbose {
                     println!(
-                        "Time: {:?} | Count: {} | Vector size: {}",
+                        "Time: {:?} | Rows: {} | Vector size: {}",
                         elapsed.as_millis(),
-                        count,
+                        ids.len(),
                         sample.vector.len()
                     );
                     println!("SQL: {}", query);
