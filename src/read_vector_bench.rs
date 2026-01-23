@@ -250,6 +250,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let logger = Arc::new(QueryLogger::new(&args.output_file, &table_name)?);
     let samples = Arc::new(samples);
+
+    println!("> Warm-up: running one vector query...");
+    if let Some(sample) = samples.first() {
+        let warmup_query = build_vector_query(&table_name, &sample.vector);
+        let warmup_start = Instant::now();
+        let warmup_result: Result<Vec<i64>, sqlx::Error> =
+            sqlx::query_scalar(&warmup_query).fetch_all(&pool).await;
+        let warmup_elapsed = warmup_start.elapsed();
+        logger.log_query(&warmup_query, warmup_elapsed);
+
+        match warmup_result {
+            Ok(ids) => {
+                println!(
+                    "✓ Warm-up done: {:?} (rows={})",
+                    warmup_elapsed, ids.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("Warm-up query error: {}", e);
+            }
+        }
+    }
+
     let start_time = Instant::now();
     let duration = Duration::from_secs(args.duration);
 
