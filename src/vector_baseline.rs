@@ -190,18 +190,52 @@ async fn insert_baseline_data(
     src_table: &str,
     dst_table: &str,
 ) -> Result<u64, sqlx::Error> {
-    let insert_sql = format!(
-        r#"
-        INSERT INTO `{dst}` (id, vector_text, embedding)
-        SELECT id, vector, VEC_FROM_TEXT(CONCAT('[', vector, ']'))
-        FROM `{src}`
-        WHERE vector IS NOT NULL AND TRIM(vector) <> '';
-        "#,
-        src = src_table,
-        dst = dst_table
-    );
-    let result = sqlx::query(&insert_sql).execute(pool).await?;
-    Ok(result.rows_affected())
+    const BATCH_SIZE: i64 = 5000;
+    let mut total_rows = 0u64;
+    let mut last_id: i64 = 0;
+
+    loop {
+        let insert_sql = format!(
+            r#"
+            INSERT INTO `{dst}` (id, vector_text, embedding)
+            SELECT id, vector, VEC_FROM_TEXT(CONCAT('[', vector, ']'))
+            FROM `{src}`
+            WHERE vector IS NOT NULL AND TRIM(vector) <> '' AND id > ?
+            ORDER BY id
+            LIMIT ?;
+            "#,
+            src = src_table,
+            dst = dst_table
+        );
+
+        let result = sqlx::query(&insert_sql)
+            .bind(last_id)
+            .bind(BATCH_SIZE)
+            .execute(pool)
+            .await?;
+        let rows = result.rows_affected();
+        if rows == 0 {
+            break;
+        }
+        total_rows += rows;
+
+        let max_id_sql = format!(
+            r#"
+            SELECT MAX(id) FROM `{dst}`
+            "#,
+            dst = dst_table
+        );
+        let max_id: Option<i64> = sqlx::query_scalar(&max_id_sql).fetch_one(pool).await?;
+        if let Some(id) = max_id {
+            last_id = id;
+        } else {
+            break;
+        }
+
+        println!("inserted rows so far: {}", total_rows);
+    }
+
+    Ok(total_rows)
 }
 
 async fn create_vector_index(pool: &Pool<MySql>, table_name: &str) -> Result<(), sqlx::Error> {
