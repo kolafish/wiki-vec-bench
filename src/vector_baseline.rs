@@ -5,7 +5,7 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
-use sqlx::{MySql, Pool};
+use sqlx::{MySql, Pool, Row, Column};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::{Arc, Mutex};
@@ -246,7 +246,10 @@ async fn create_vector_index(pool: &Pool<MySql>, table_name: &str) -> Result<(),
         "ALTER TABLE `{}` ADD VECTOR INDEX idx_embedding ((VEC_COSINE_DISTANCE(embedding)))",
         table_name
     );
-    sqlx::query(&sql).execute(pool).await?;
+    if let Err(e) = sqlx::query(&sql).execute(pool).await {
+        eprintln!("vector index creation failed: {}", sql);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -389,25 +392,75 @@ async fn table_has_rows(pool: &Pool<MySql>, table_name: &str) -> Result<bool, sq
     Ok(exists.is_some())
 }
 
+fn find_column<'a>(cols: &'a [sqlx::mysql::MySqlColumn], candidates: &[&str]) -> Option<&'a str> {
+    for col in cols {
+        let name = col.name();
+        if candidates.iter().any(|c| name.eq_ignore_ascii_case(c)) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 async fn get_index_progress(
     pool: &Pool<MySql>,
     table_name: &str,
     index_name: &str,
-) -> Result<Option<IndexProgress>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT rows_stable_indexed, rows_stable_not_indexed
-         FROM information_schema.tiflash_indexes
-         WHERE table_name = ? AND index_name = ?",
-    )
-    .bind(table_name)
-    .bind(index_name)
-    .fetch_optional(pool)
-    .await
+) -> Result<Option<IndexProgress>, Box<dyn std::error::Error>> {
+    let sql = "SELECT * FROM information_schema.tiflash_indexes";
+    let rows = sqlx::query(sql)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| {
+            eprintln!("index progress query failed: {}", sql);
+            e
+        })?;
+
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let cols = rows[0].columns();
+    let table_col = find_column(cols, &["table_name", "table", "tbl_name"])
+        .ok_or_else(|| {
+            let names: Vec<&str> = cols.iter().map(|c| c.name()).collect();
+            format!("missing table name column in tiflash_indexes: {:?}", names)
+        })?;
+    let index_col = find_column(cols, &["index_name", "index", "idx_name"])
+        .ok_or_else(|| {
+            let names: Vec<&str> = cols.iter().map(|c| c.name()).collect();
+            format!("missing index name column in tiflash_indexes: {:?}", names)
+        })?;
+    let indexed_col = find_column(cols, &["rows_stable_indexed"])
+        .ok_or_else(|| {
+            let names: Vec<&str> = cols.iter().map(|c| c.name()).collect();
+            format!("missing rows_stable_indexed column in tiflash_indexes: {:?}", names)
+        })?;
+    let not_indexed_col = find_column(cols, &["rows_stable_not_indexed"])
+        .ok_or_else(|| {
+            let names: Vec<&str> = cols.iter().map(|c| c.name()).collect();
+            format!("missing rows_stable_not_indexed column in tiflash_indexes: {:?}", names)
+        })?;
+
+    for row in rows {
+        let table_val: String = row.try_get(table_col)?;
+        let index_val: String = row.try_get(index_col)?;
+        if table_val == table_name && index_val == index_name {
+            let indexed: i64 = row.try_get(indexed_col)?;
+            let not_indexed: i64 = row.try_get(not_indexed_col)?;
+            return Ok(Some(IndexProgress {
+                rows_stable_indexed: Some(indexed),
+                rows_stable_not_indexed: Some(not_indexed),
+            }));
+        }
+    }
+
+    Ok(None)
 }
 
 async fn wait_for_index_build(
     pool: &Pool<MySql>,
-    db_name: &str,
+    _db_name: &str,
     table_name: &str,
     index_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
