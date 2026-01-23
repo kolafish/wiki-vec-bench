@@ -473,7 +473,7 @@ async fn get_index_progress(
 
 async fn wait_for_index_build(
     pool: &Pool<MySql>,
-    _db_name: &str,
+    db_name: &str,
     table_name: &str,
     index_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
