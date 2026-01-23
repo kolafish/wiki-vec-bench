@@ -147,3 +147,15 @@ cargo build --release
   --concurrency 16 \
   --duration 60
 ```
+
+## Freshness benchmark (freshness-bench)
+
+```bash
+./target/release/freshness-bench
+
+./target/release/freshness-bench \
+  --read-concurrency 16 \
+  --write-concurrency 2 \
+  --duration 120 \
+  --write-interval-ms 5
+```

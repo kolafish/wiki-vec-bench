@@ -15,6 +15,10 @@ path = "src/read_vector_bench.rs"
 name = "vector-baseline"
 path = "src/vector_baseline.rs"
 
+[[bin]]
+name = "freshness-bench"
+path = "src/freshness_bench.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
