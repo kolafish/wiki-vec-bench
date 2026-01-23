@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use rand::rngs::StdRng;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 use sqlx::{MySql, Pool};

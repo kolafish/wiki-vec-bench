@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use rand::rngs::StdRng;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 use sqlx::{MySql, Pool, Row, Column};
@@ -442,12 +442,17 @@ async fn get_index_progress(
             format!("missing rows_stable_not_indexed column in tiflash_indexes: {:?}", names)
         })?;
 
-    for row in rows {
-        let table_val: String = row.try_get(table_col)?;
-        let index_val: String = row.try_get(index_col)?;
+    let table_col = table_col.to_string();
+    let index_col = index_col.to_string();
+    let indexed_col = indexed_col.to_string();
+    let not_indexed_col = not_indexed_col.to_string();
+
+    for row in rows.iter() {
+        let table_val: String = row.try_get(table_col.as_str())?;
+        let index_val: String = row.try_get(index_col.as_str())?;
         if table_val == table_name && index_val == index_name {
-            let indexed: i64 = row.try_get(indexed_col)?;
-            let not_indexed: i64 = row.try_get(not_indexed_col)?;
+            let indexed: i64 = row.try_get(indexed_col.as_str())?;
+            let not_indexed: i64 = row.try_get(not_indexed_col.as_str())?;
             return Ok(Some(IndexProgress {
                 rows_stable_indexed: Some(indexed),
                 rows_stable_not_indexed: Some(not_indexed),
