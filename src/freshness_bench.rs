@@ -98,6 +98,7 @@ fn escape_sql_string(s: &str) -> String {
         .replace('\0', "\\0")
 }
 
+#[derive(Copy, Clone)]
 enum SearchMode {
     Fulltext,
     TikvLike,
