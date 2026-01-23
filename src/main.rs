@@ -33,6 +33,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     build_index: bool,
 
+    /// Include vector in FULLTEXT index (requires --build-index)
+    #[arg(long, default_value_t = false)]
+    index_with_vector: bool,
+
     /// Enable verbose logging (print individual SQLs)
     #[arg(long, default_value_t = false)]
     verbose: bool,
@@ -87,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("concurrency    : {}", args.concurrency);
     println!("duration       : {}s", args.duration);
     println!("build_index    : {}", args.build_index);
+    println!("index_with_vector: {}", args.index_with_vector);
     println!("use_random_data: {}", args.use_random_data);
 
     // Global TiDB connection settings
@@ -116,7 +121,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create table with timestamp suffix and optional FULLTEXT index automatically
-    let table_name = Arc::new(create_table_with_index(&pool, args.build_index).await?);
+    let table_name = Arc::new(
+        create_table_with_index(&pool, args.build_index, args.index_with_vector).await?
+    );
     println!("using table: {}", table_name);
 
     let id_counter = Arc::new(AtomicU64::new(1));
@@ -396,8 +403,12 @@ fn generate_random_samples(count: usize) -> Vec<SampleRow> {
     samples
 }
 
-/// Create a new table with timestamp suffix and optionally add FULLTEXT index on (title, text).
-async fn create_table_with_index(pool: &Pool<MySql>, build_index: bool) -> Result<String, sqlx::Error> {
+/// Create a new table with timestamp suffix and optionally add FULLTEXT index.
+async fn create_table_with_index(
+    pool: &Pool<MySql>,
+    build_index: bool,
+    index_with_vector: bool,
+) -> Result<String, sqlx::Error> {
     let ts = Local::now().format("%Y%m%d%H%M%S").to_string();
     let table_name = format!("wiki_paragraphs_embeddings_{}", ts);
 
@@ -424,12 +435,18 @@ async fn create_table_with_index(pool: &Pool<MySql>, build_index: bool) -> Resul
     sqlx::query(&create_sql).execute(pool).await?;
 
     if build_index {
+        let index_columns = if index_with_vector {
+            "title, text, vector"
+        } else {
+            "title, text"
+        };
         let alter_sql = format!(
             r#"
             ALTER TABLE `{table}`
-              ADD FULLTEXT INDEX ft_index (title, text) WITH PARSER standard;
+              ADD FULLTEXT INDEX ft_index ({cols}) WITH PARSER standard;
             "#,
-            table = table_name
+            table = table_name,
+            cols = index_columns
         );
 
         // Try to add FULLTEXT index; ignore error if it already exists

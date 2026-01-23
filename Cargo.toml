@@ -7,6 +7,10 @@ edition = "2021"
 name = "read-bench"
 path = "src/read_bench.rs"
 
+[[bin]]
+name = "read-vector-bench"
+path = "src/read_vector_bench.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
