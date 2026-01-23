@@ -207,30 +207,42 @@ async fn preload_rows(
     start_id: u64,
     count: u64,
 ) -> Result<u64, sqlx::Error> {
+    const BATCH_SIZE: u64 = 1000;
     let mut rng = StdRng::from_entropy();
     let mut current_id = start_id;
-    for i in 0..count {
-        let id1 = current_id as i64;
-        let id2: i32 = rng.gen_range(1..1_000_000);
-        let ts_ms = now_ms();
-        let ts_text = ts_ms.to_string();
-        let sql = format!(
-            "INSERT INTO `{}` (id1, id2, write_ts, write_ts_text) VALUES (?, ?, ?, ?)",
-            table_name
-        );
-        sqlx::query(&sql)
-            .bind(id1)
-            .bind(id2)
-            .bind(ts_ms)
-            .bind(&ts_text)
-            .execute(pool)
-            .await?;
+    let mut total = 0u64;
 
-        current_id += 1;
-        if (i + 1) % 10_000 == 0 {
-            println!("preloaded rows: {}", i + 1);
+    while total < count {
+        let batch = (count - total).min(BATCH_SIZE);
+        let now = now_ms();
+        let mut values = String::new();
+        values.reserve((batch as usize) * 32);
+
+        for i in 0..batch {
+            let id1 = (current_id + i) as i64;
+            let id2: i32 = rng.gen_range(1..1_000_000);
+            if i > 0 {
+                values.push(',');
+            }
+            values.push_str(&format!(
+                "({}, {}, {}, '{}')",
+                id1, id2, now, now
+            ));
+        }
+
+        let sql = format!(
+            "INSERT INTO `{}` (id1, id2, write_ts, write_ts_text) VALUES {}",
+            table_name, values
+        );
+        sqlx::query(&sql).execute(pool).await?;
+
+        current_id += batch;
+        total += batch;
+        if total % 10_000 == 0 || total == count {
+            println!("preloaded rows: {}", total);
         }
     }
+
     Ok(current_id)
 }
 
