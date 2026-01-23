@@ -7,7 +7,7 @@ use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 use sqlx::{MySql, Pool};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use chrono::Local;
@@ -64,6 +64,37 @@ struct ReaderStats {
     read_lat_ms: Vec<u64>,
     errors: u64,
     misses: u64,
+}
+
+struct QueryLogger {
+    writer: Arc<StdMutex<std::io::BufWriter<std::fs::File>>>,
+}
+
+impl QueryLogger {
+    fn new(path: &str, table_name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        writeln!(writer, "-- TiDB Freshness Benchmark Read Queries")?;
+        writeln!(writer, "-- Table: {}", table_name)?;
+        writeln!(writer, "-- Generated at: {:?}", std::time::SystemTime::now())?;
+        writeln!(writer, "")?;
+        writer.flush()?;
+        Ok(Self {
+            writer: Arc::new(StdMutex::new(writer)),
+        })
+    }
+
+    fn log_query(&self, phase: &str, sql: &str, duration: Duration) {
+        if let Ok(mut writer) = self.writer.lock() {
+            let _ = writeln!(
+                writer,
+                "-- {} Read (Execution time: {:.2}ms)",
+                phase,
+                duration.as_secs_f64() * 1000.0
+            );
+            let _ = writeln!(writer, "{}\n", sql.trim());
+        }
+    }
 }
 
 impl ReaderStats {
@@ -225,6 +256,8 @@ async fn run_reader(
     duration: Duration,
     verbose: bool,
     mode: SearchMode,
+    logger: Arc<QueryLogger>,
+    phase: &'static str,
 ) -> ReaderStats {
     let mut stats = ReaderStats::new();
     while start_time.elapsed() < duration {
@@ -247,6 +280,7 @@ async fn run_reader(
             let result: Result<Option<i64>, sqlx::Error> =
                 sqlx::query_scalar(&query).fetch_optional(&pool).await;
             let read_elapsed = read_start.elapsed();
+            logger.log_query(phase, &query, read_elapsed);
             match result {
                 Ok(Some(write_ts)) => {
                     let lag = now_ms().saturating_sub(write_ts) as u64;
@@ -309,6 +343,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let table_name = create_table_with_index(&pool).await?;
     println!("using table: {}", table_name);
+    let logger = Arc::new(QueryLogger::new("freshness_read_queries.sql", &table_name)?);
 
     let queue: Arc<Mutex<VecDeque<WriteRecord>>> = Arc::new(Mutex::new(VecDeque::new()));
     let id_counter = Arc::new(AtomicU64::new(1));
@@ -348,6 +383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let table_name = table_name.clone();
         let queue = queue.clone();
         let verbose = args.verbose;
+        let logger = logger.clone();
         let handle = tokio::spawn(async move {
             run_reader(
                 pool,
@@ -357,6 +393,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 duration,
                 verbose,
                 SearchMode::Fulltext,
+                logger,
+                "FULLTEXT",
             )
             .await
         });
@@ -404,6 +442,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- Starting TiKV LIKE comparison (no FULLTEXT index) ---");
     let table_name = create_table_without_index(&pool).await?;
     println!("using table: {}", table_name);
+    let logger = Arc::new(QueryLogger::new("freshness_read_queries_tikv.sql", &table_name)?);
 
     let queue: Arc<Mutex<VecDeque<WriteRecord>>> = Arc::new(Mutex::new(VecDeque::new()));
     let id_counter = Arc::new(AtomicU64::new(1));
@@ -443,6 +482,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let table_name = table_name.clone();
         let queue = queue.clone();
         let verbose = args.verbose;
+        let logger = logger.clone();
         let handle = tokio::spawn(async move {
             run_reader(
                 pool,
@@ -452,6 +492,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 duration,
                 verbose,
                 SearchMode::TikvLike,
+                logger,
+                "TIKV_LIKE",
             )
             .await
         });
