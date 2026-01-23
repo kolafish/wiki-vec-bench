@@ -17,6 +17,7 @@ const DEFAULT_DB_HOST: &str = "127.0.0.1";
 const DEFAULT_DB_PORT: u16 = 4000;
 const DEFAULT_DB_USER: &str = "root";
 const DEFAULT_DB_NAME: &str = "test";
+const PRELOAD_ROWS: u64 = 100_000;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "TiDB freshness benchmark using FULLTEXT on timestamp string")]
@@ -200,6 +201,39 @@ async fn create_table_without_index(pool: &Pool<MySql>) -> Result<String, sqlx::
     Ok(table_name)
 }
 
+async fn preload_rows(
+    pool: &Pool<MySql>,
+    table_name: &str,
+    start_id: u64,
+    count: u64,
+) -> Result<u64, sqlx::Error> {
+    let mut rng = StdRng::from_entropy();
+    let mut current_id = start_id;
+    for i in 0..count {
+        let id1 = current_id as i64;
+        let id2: i32 = rng.gen_range(1..1_000_000);
+        let ts_ms = now_ms();
+        let ts_text = ts_ms.to_string();
+        let sql = format!(
+            "INSERT INTO `{}` (id1, id2, write_ts, write_ts_text) VALUES (?, ?, ?, ?)",
+            table_name
+        );
+        sqlx::query(&sql)
+            .bind(id1)
+            .bind(id2)
+            .bind(ts_ms)
+            .bind(&ts_text)
+            .execute(pool)
+            .await?;
+
+        current_id += 1;
+        if (i + 1) % 10_000 == 0 {
+            println!("preloaded rows: {}", i + 1);
+        }
+    }
+    Ok(current_id)
+}
+
 async fn run_writer(
     pool: Pool<MySql>,
     table_name: String,
@@ -349,7 +383,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logger = Arc::new(QueryLogger::new("freshness_read_queries.sql", &table_name)?);
 
     let queue: Arc<Mutex<VecDeque<WriteRecord>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let id_counter = Arc::new(AtomicU64::new(1));
+    println!("preloading {} rows...", PRELOAD_ROWS);
+    let next_id = preload_rows(&pool, &table_name, 1, PRELOAD_ROWS).await?;
+    let id_counter = Arc::new(AtomicU64::new(next_id));
     let write_counter = Arc::new(AtomicU64::new(0));
     let start_time = Instant::now();
     let duration = Duration::from_secs(args.duration);
@@ -448,7 +484,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logger = Arc::new(QueryLogger::new("freshness_read_queries_tikv.sql", &table_name)?);
 
     let queue: Arc<Mutex<VecDeque<WriteRecord>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let id_counter = Arc::new(AtomicU64::new(1));
+    println!("preloading {} rows...", PRELOAD_ROWS);
+    let next_id = preload_rows(&pool, &table_name, 1, PRELOAD_ROWS).await?;
+    let id_counter = Arc::new(AtomicU64::new(next_id));
     let write_counter = Arc::new(AtomicU64::new(0));
     let start_time = Instant::now();
     let duration = Duration::from_secs(args.duration);
