@@ -139,6 +139,7 @@ async fn run_writer(
     table_name: String,
     queue: Arc<Mutex<VecDeque<WriteRecord>>>,
     id_counter: Arc<AtomicU64>,
+    write_counter: Arc<AtomicU64>,
     start_time: Instant,
     duration: Duration,
     interval: Duration,
@@ -168,6 +169,7 @@ async fn run_writer(
                 let record = WriteRecord { ts_ms, ts_text };
                 let mut guard = queue.lock().await;
                 guard.push_back(record);
+                write_counter.fetch_add(1, Ordering::Relaxed);
                 if verbose {
                     println!("write id1={} id2={} ts={}", id1, id2, ts_ms);
                 }
@@ -231,12 +233,12 @@ async fn run_reader(
     stats
 }
 
-fn percentile_p95(values: &mut [u64]) -> Option<u64> {
+fn percentile(values: &mut [u64], pct: f64) -> Option<u64> {
     if values.is_empty() {
         return None;
     }
     values.sort_unstable();
-    let idx = ((values.len() as f64) * 0.95).ceil() as usize - 1;
+    let idx = ((values.len() as f64) * pct).ceil() as usize - 1;
     values.get(idx).copied()
 }
 
@@ -267,6 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let queue: Arc<Mutex<VecDeque<WriteRecord>>> = Arc::new(Mutex::new(VecDeque::new()));
     let id_counter = Arc::new(AtomicU64::new(1));
+    let write_counter = Arc::new(AtomicU64::new(0));
     let start_time = Instant::now();
     let duration = Duration::from_secs(args.duration);
     let interval = Duration::from_millis(args.write_interval_ms);
@@ -277,6 +280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let table_name = table_name.clone();
         let queue = queue.clone();
         let id_counter = id_counter.clone();
+        let write_counter = write_counter.clone();
         let verbose = args.verbose;
         let handle = tokio::spawn(async move {
             run_writer(
@@ -284,6 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 table_name,
                 queue,
                 id_counter,
+                write_counter,
                 start_time,
                 duration,
                 interval,
@@ -317,17 +322,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let elapsed = start_time.elapsed();
     let total_reads = combined.lags_ms.len();
-    let p95 = percentile_p95(&mut combined.lags_ms);
+    let p95 = percentile(&mut combined.lags_ms, 0.95);
+    let p99 = percentile(&mut combined.lags_ms, 0.99);
+    let write_qps = write_counter.load(Ordering::Relaxed) as f64 / elapsed.as_secs_f64();
 
     println!();
     println!("=== Summary ===");
     println!("Elapsed      : {:.2?}", elapsed);
+    println!("Write QPS    : {:.2}", write_qps);
     println!("Reads        : {}", total_reads);
     println!("Read errors  : {}", combined.errors);
     println!("Read misses  : {}", combined.misses);
     match p95 {
         Some(v) => println!("Freshness p95: {} ms", v),
         None => println!("Freshness p95: n/a"),
+    }
+    match p99 {
+        Some(v) => println!("Freshness p99: {} ms", v),
+        None => println!("Freshness p99: n/a"),
     }
 
     Ok(())
