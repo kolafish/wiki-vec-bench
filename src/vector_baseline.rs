@@ -126,7 +126,7 @@ fn escape_sql_string(s: &str) -> String {
 fn build_baseline_query(table_name: &str, vector_query: &str) -> String {
     let escaped = escape_sql_string(vector_query);
     format!(
-        "SELECT * FROM `{}` ORDER BY VEC_COSINE_DISTANCE(embedding, '{}') LIMIT 10",
+        "SELECT id FROM `{}` ORDER BY VEC_COSINE_DISTANCE(embedding, '{}') LIMIT 10",
         table_name, escaped
     )
 }
