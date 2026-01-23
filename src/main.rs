@@ -135,6 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pool = pool.clone();
         let mode = args.mode.clone();
         let verbose = args.verbose;
+        let index_with_vector = args.index_with_vector;
         let id_counter = id_counter.clone();
         let table_name = table_name.clone();
         let samples = samples.clone();
@@ -146,9 +147,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while start_time.elapsed() < run_duration {
                 let op_start = Instant::now();
                 let result = if mode == "insert-only" {
-                    run_insert(&pool, &table_name, &samples, &mut rng, &id_counter, verbose).await
+                    run_insert(
+                        &pool,
+                        &table_name,
+                        &samples,
+                        &mut rng,
+                        &id_counter,
+                        verbose,
+                        index_with_vector,
+                    )
+                    .await
                 } else {
-                    run_update_mixed(&pool, &table_name, &samples, &mut rng, &id_counter, verbose).await
+                    run_update_mixed(
+                        &pool,
+                        &table_name,
+                        &samples,
+                        &mut rng,
+                        &id_counter,
+                        verbose,
+                        index_with_vector,
+                    )
+                    .await
                 };
 
                 match result {
@@ -257,6 +276,7 @@ async fn run_insert(
     rng: &mut impl Rng,
     id_counter: &AtomicU64,
     verbose: bool,
+    index_with_vector: bool,
 ) -> Result<(u32, OpKind), sqlx::Error> {
     let id = id_counter.fetch_add(1, Ordering::Relaxed) as i64;
     let wiki_id = id;
@@ -285,6 +305,12 @@ async fn run_insert(
         }
     };
     let vector = sample.vector.clone();
+    if index_with_vector && vector.trim().is_empty() {
+        if verbose {
+            println!("SKIP insert id={} due to empty vector", id);
+        }
+        return Ok((0, OpKind::Skip));
+    }
 
     let sql = format!(
         r#"
@@ -322,11 +348,21 @@ async fn run_update_mixed(
     rng: &mut impl Rng,
     id_counter: &AtomicU64,
     verbose: bool,
+    index_with_vector: bool,
 ) -> Result<(u32, OpKind), sqlx::Error> {
     let current_max = id_counter.load(Ordering::Relaxed);
     // If there is no data yet, fall back to insert
     if current_max <= 1 || rng.gen_bool(0.5) {
-        return run_insert(pool, table_name, samples, rng, id_counter, verbose).await;
+        return run_insert(
+            pool,
+            table_name,
+            samples,
+            rng,
+            id_counter,
+            verbose,
+            index_with_vector,
+        )
+        .await;
     }
 
     let target_id = rng.gen_range(1..current_max) as i64;
