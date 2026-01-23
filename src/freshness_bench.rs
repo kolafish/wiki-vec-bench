@@ -98,12 +98,23 @@ fn escape_sql_string(s: &str) -> String {
         .replace('\0', "\\0")
 }
 
-fn build_read_query(table_name: &str, ts_text: &str) -> String {
+enum SearchMode {
+    Fulltext,
+    TikvLike,
+}
+
+fn build_read_query(table_name: &str, ts_text: &str, mode: SearchMode) -> String {
     let escaped = escape_sql_string(ts_text);
-    format!(
-        "SELECT write_ts FROM `{}` WHERE fts_match_word('{}', write_ts_text) LIMIT 1",
-        table_name, escaped
-    )
+    match mode {
+        SearchMode::Fulltext => format!(
+            "SELECT write_ts FROM `{}` WHERE fts_match_word('{}', write_ts_text) LIMIT 1",
+            table_name, escaped
+        ),
+        SearchMode::TikvLike => format!(
+            "SELECT /*+ READ_FROM_STORAGE(TIKV[`{}`]) */ write_ts FROM `{}` WHERE write_ts_text LIKE '%{}%' LIMIT 1",
+            table_name, table_name, escaped
+        ),
+    }
 }
 
 async fn create_table_with_index(pool: &Pool<MySql>) -> Result<String, sqlx::Error> {
@@ -134,6 +145,25 @@ async fn create_table_with_index(pool: &Pool<MySql>) -> Result<String, sqlx::Err
         eprintln!("warning: failed to add FULLTEXT index: {}", e);
     }
 
+    Ok(table_name)
+}
+
+async fn create_table_without_index(pool: &Pool<MySql>) -> Result<String, sqlx::Error> {
+    let ts = Local::now().format("%Y%m%d%H%M%S").to_string();
+    let table_name = format!("freshness_noindex_{}", ts);
+    let create_sql = format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS `{table}` (
+          id1           BIGINT      NOT NULL,
+          id2           INT         NOT NULL,
+          write_ts      BIGINT      NOT NULL,
+          write_ts_text VARCHAR(32) NOT NULL,
+          PRIMARY KEY (id1, id2)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        "#,
+        table = table_name
+    );
+    sqlx::query(&create_sql).execute(pool).await?;
     Ok(table_name)
 }
 
@@ -193,6 +223,7 @@ async fn run_reader(
     start_time: Instant,
     duration: Duration,
     verbose: bool,
+    mode: SearchMode,
 ) -> ReaderStats {
     let mut stats = ReaderStats::new();
     while start_time.elapsed() < duration {
@@ -210,7 +241,7 @@ async fn run_reader(
                 stats.misses += 1;
                 break;
             }
-            let query = build_read_query(&table_name, &record.ts_text);
+            let query = build_read_query(&table_name, &record.ts_text, mode);
             let read_start = Instant::now();
             let result: Result<Option<i64>, sqlx::Error> =
                 sqlx::query_scalar(&query).fetch_optional(&pool).await;
@@ -317,7 +348,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let queue = queue.clone();
         let verbose = args.verbose;
         let handle = tokio::spawn(async move {
-            run_reader(pool, table_name, queue, start_time, duration, verbose).await
+            run_reader(
+                pool,
+                table_name,
+                queue,
+                start_time,
+                duration,
+                verbose,
+                SearchMode::Fulltext,
+            )
+            .await
         });
         reader_handles.push(handle);
     }
@@ -339,7 +379,102 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let write_qps = write_counter.load(Ordering::Relaxed) as f64 / elapsed.as_secs_f64();
 
     println!();
-    println!("=== Summary ===");
+    println!("=== Summary (FULLTEXT) ===");
+    println!("Elapsed      : {:.2?}", elapsed);
+    println!("Write QPS    : {:.2}", write_qps);
+    println!("Reads        : {}", total_reads);
+    println!("Read errors  : {}", combined.errors);
+    println!("Read misses  : {}", combined.misses);
+    match read_p95 {
+        Some(v) => println!("Read p95     : {} ms", v),
+        None => println!("Read p95     : n/a"),
+    }
+    match read_p99 {
+        Some(v) => println!("Read p99     : {} ms", v),
+        None => println!("Read p99     : n/a"),
+    }
+    match freshness_p95 {
+        Some(v) => println!("Freshness p95: {} ms", v),
+        None => println!("Freshness p95: n/a"),
+    }
+
+    // Second phase: no FULLTEXT index, read from TiKV with LIKE
+    println!();
+    println!("--- Starting TiKV LIKE comparison (no FULLTEXT index) ---");
+    let table_name = create_table_without_index(&pool).await?;
+    println!("using table: {}", table_name);
+
+    let queue: Arc<Mutex<VecDeque<WriteRecord>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let id_counter = Arc::new(AtomicU64::new(1));
+    let write_counter = Arc::new(AtomicU64::new(0));
+    let start_time = Instant::now();
+    let duration = Duration::from_secs(args.duration);
+    let interval = Duration::from_millis(args.write_interval_ms);
+
+    let mut writer_handles = Vec::with_capacity(args.write_concurrency);
+    for _ in 0..args.write_concurrency {
+        let pool = pool.clone();
+        let table_name = table_name.clone();
+        let queue = queue.clone();
+        let id_counter = id_counter.clone();
+        let write_counter = write_counter.clone();
+        let verbose = args.verbose;
+        let handle = tokio::spawn(async move {
+            run_writer(
+                pool,
+                table_name,
+                queue,
+                id_counter,
+                write_counter,
+                start_time,
+                duration,
+                interval,
+                verbose,
+            )
+            .await
+        });
+        writer_handles.push(handle);
+    }
+
+    let mut reader_handles = Vec::with_capacity(args.read_concurrency);
+    for _ in 0..args.read_concurrency {
+        let pool = pool.clone();
+        let table_name = table_name.clone();
+        let queue = queue.clone();
+        let verbose = args.verbose;
+        let handle = tokio::spawn(async move {
+            run_reader(
+                pool,
+                table_name,
+                queue,
+                start_time,
+                duration,
+                verbose,
+                SearchMode::TikvLike,
+            )
+            .await
+        });
+        reader_handles.push(handle);
+    }
+
+    for handle in writer_handles {
+        let _ = handle.await;
+    }
+
+    let mut combined = ReaderStats::new();
+    for handle in reader_handles {
+        combined.merge(handle.await?);
+    }
+
+    let elapsed = start_time.elapsed();
+    let total_reads = combined.lags_ms.len();
+    let freshness_p95 = percentile(&mut combined.lags_ms, 0.95);
+    let read_p95 = percentile(&mut combined.read_lat_ms, 0.95);
+    let read_p99 = percentile(&mut combined.read_lat_ms, 0.99);
+    let write_qps = write_counter.load(Ordering::Relaxed) as f64 / elapsed.as_secs_f64();
+
+    println!();
+    println!("=== Summary (TiKV LIKE) ===");
     println!("Elapsed      : {:.2?}", elapsed);
     println!("Write QPS    : {:.2}", write_qps);
     println!("Reads        : {}", total_reads);
