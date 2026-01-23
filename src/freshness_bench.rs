@@ -264,7 +264,9 @@ async fn run_reader(
     while start_time.elapsed() < duration {
         let record = {
             let mut guard = queue.lock().await;
-            guard.pop_front()
+            let latest = guard.pop_back();
+            guard.clear();
+            latest
         };
         let Some(record) = record else {
             tokio::time::sleep(Duration::from_millis(5)).await;
