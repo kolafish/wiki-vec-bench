@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 use sqlx::{MySql, Pool, Row, Column};
@@ -37,6 +37,10 @@ struct Args {
     /// Enable verbose logging (print individual SQLs)
     #[arg(long, default_value_t = false)]
     verbose: bool,
+
+    /// Enable concurrent inserts during benchmark
+    #[arg(long, default_value_t = false)]
+    realtime_insert: bool,
 
     /// Output file path for SQL queries log
     #[arg(long, default_value = "vector_baseline_queries.sql")]
@@ -161,6 +165,47 @@ fn infer_vector_dim(vector: &str) -> usize {
 
 fn wrap_vector_literal(vector: &str) -> String {
     format!("[{}]", vector)
+}
+
+fn build_random_vector_string(rng: &mut impl rand::Rng, dim: usize) -> String {
+    let mut out = String::with_capacity(dim * 8);
+    for i in 0..dim {
+        let v: f32 = rng.gen_range(-0.2..0.2);
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("{:.6}", v));
+    }
+    out
+}
+
+async fn run_realtime_inserts(
+    pool: Pool<MySql>,
+    table_name: String,
+    vector_dim: usize,
+    start_time: Instant,
+    duration: Duration,
+) {
+    let mut rng = StdRng::from_entropy();
+    while start_time.elapsed() < duration {
+        let id = rng.gen::<i64>().abs();
+        let vector_text = build_random_vector_string(&mut rng, vector_dim);
+        let sql = format!(
+            "INSERT INTO `{}` (id, vector_text, embedding) VALUES (?, ?, VEC_FROM_TEXT(?))",
+            table_name
+        );
+        let vector_literal = wrap_vector_literal(&vector_text);
+        if let Err(e) = sqlx::query(&sql)
+            .bind(id)
+            .bind(&vector_text)
+            .bind(&vector_literal)
+            .execute(&pool)
+            .await
+        {
+            eprintln!("realtime insert error: {}", e);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn extract_timestamp_suffix(table_name: &str) -> Option<&str> {
@@ -589,6 +634,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("duration       : {}s", args.duration);
     println!("sample_size    : {}", args.sample_size);
     println!("output_file    : {}", args.output_file);
+    println!("realtime_insert: {}", args.realtime_insert);
 
     let opts = MySqlConnectOptions::new()
         .host(&args.db_host)
@@ -683,6 +729,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let start_time = Instant::now();
     let duration = Duration::from_secs(args.duration);
+    if args.realtime_insert {
+        let pool = pool.clone();
+        let table_name = baseline_table.clone();
+        tokio::spawn(async move {
+            run_realtime_inserts(pool, table_name, vector_dim, start_time, duration).await
+        });
+    }
     let mut handles = Vec::with_capacity(args.concurrency);
     for _ in 0..args.concurrency {
         let pool = pool.clone();

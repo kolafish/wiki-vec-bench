@@ -136,6 +136,11 @@ cargo build --release
   --verbose
 
 ./target/release/vector-baseline \
+  --realtime-insert \
+  --concurrency 16 \
+  --duration 60
+
+./target/release/vector-baseline \
   --db-host 10.0.1.100 \
   --db-port 4000 \
   --db-name production_db \
