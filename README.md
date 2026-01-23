@@ -120,3 +120,25 @@ cargo build --release
   --concurrency 16 \
   --duration 60
 ```
+
+## Vector baseline (vector-baseline)
+
+```bash
+./target/release/vector-baseline
+
+./target/release/vector-baseline \
+  --concurrency 32 \
+  --duration 120
+
+./target/release/vector-baseline \
+  --sample-size 5000 \
+  --output-file vector_baseline.sql \
+  --verbose
+
+./target/release/vector-baseline \
+  --db-host 10.0.1.100 \
+  --db-port 4000 \
+  --db-name production_db \
+  --concurrency 16 \
+  --duration 60
+```

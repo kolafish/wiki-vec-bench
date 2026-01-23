@@ -11,6 +11,10 @@ path = "src/read_bench.rs"
 name = "read-vector-bench"
 path = "src/read_vector_bench.rs"
 
+[[bin]]
+name = "vector-baseline"
+path = "src/vector_baseline.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
