@@ -10,7 +10,6 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use chrono::Local;
 
 const DEFAULT_DB_HOST: &str = "127.0.0.1";
 const DEFAULT_DB_PORT: u16 = 4000;
@@ -162,6 +161,10 @@ fn infer_vector_dim(vector: &str) -> usize {
 
 fn wrap_vector_literal(vector: &str) -> String {
     format!("[{}]", vector)
+}
+
+fn extract_timestamp_suffix(table_name: &str) -> Option<&str> {
+    table_name.rsplit_once('_').map(|(_, suffix)| suffix)
 }
 
 async fn create_baseline_table(
@@ -369,6 +372,39 @@ struct IndexProgress {
     rows_stable_not_indexed: Option<i64>,
 }
 
+async fn table_exists(pool: &Pool<MySql>, db_name: &str, table_name: &str) -> Result<bool, sqlx::Error> {
+    let exists: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+    )
+    .bind(db_name)
+    .bind(table_name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(exists.is_some())
+}
+
+async fn table_has_rows(pool: &Pool<MySql>, table_name: &str) -> Result<bool, sqlx::Error> {
+    let query = format!("SELECT 1 FROM `{}` LIMIT 1", table_name);
+    let exists: Option<i64> = sqlx::query_scalar(&query).fetch_optional(pool).await?;
+    Ok(exists.is_some())
+}
+
+async fn get_index_progress(
+    pool: &Pool<MySql>,
+    table_name: &str,
+    index_name: &str,
+) -> Result<Option<IndexProgress>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT rows_stable_indexed, rows_stable_not_indexed
+         FROM information_schema.tiflash_indexes
+         WHERE table_name = ? AND index_name = ?",
+    )
+    .bind(table_name)
+    .bind(index_name)
+    .fetch_optional(pool)
+    .await
+}
+
 async fn wait_for_index_build(
     pool: &Pool<MySql>,
     db_name: &str,
@@ -388,16 +424,7 @@ async fn wait_for_index_build(
             .into());
         }
 
-        let progress: Option<IndexProgress> = sqlx::query_as(
-            "SELECT rows_stable_indexed, rows_stable_not_indexed
-             FROM information_schema.tiflash_indexes
-             WHERE table_schema = ? AND table_name = ? AND index_name = ?",
-        )
-        .bind(db_name)
-        .bind(table_name)
-        .bind(index_name)
-        .fetch_optional(pool)
-        .await?;
+        let progress = get_index_progress(pool, table_name, index_name).await?;
 
         if let Some(p) = progress {
             let indexed = p.rows_stable_indexed.unwrap_or(0);
@@ -528,20 +555,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("inferred vector dimension: {}", vector_dim);
 
-    let ts = Local::now().format("%Y%m%d%H%M%S").to_string();
-    let baseline_table = format!("vector_baseline_{}", ts);
+    let suffix = extract_timestamp_suffix(&src_table)
+        .ok_or("Failed to extract timestamp suffix from source table")?;
+    let baseline_table = format!("vector_baseline_{}", suffix);
     println!("baseline table: {}", baseline_table);
 
-    create_baseline_table(&pool, &baseline_table, vector_dim).await?;
-    let inserted = insert_baseline_data(&pool, &src_table, &baseline_table).await?;
-    println!("inserted rows: {}", inserted);
+    if !table_exists(&pool, &args.db_name, &baseline_table).await? {
+        create_baseline_table(&pool, &baseline_table, vector_dim).await?;
+    } else {
+        println!("baseline table already exists, reusing it");
+    }
+
+    if table_has_rows(&pool, &baseline_table).await? {
+        println!("baseline table already has data, skipping insert");
+    } else {
+        let inserted = insert_baseline_data(&pool, &src_table, &baseline_table).await?;
+        println!("inserted rows: {}", inserted);
+    }
 
     let replica_mgr = TiFlashReplicaManager::new(pool.clone(), args.db_name.clone());
     replica_mgr.ensure_replica(&baseline_table).await?;
 
-    println!("> Creating vector index on TiFlash...");
-    create_vector_index(&pool, &baseline_table).await?;
-    wait_for_index_build(&pool, &args.db_name, &baseline_table, "idx_embedding").await?;
+    if let Some(progress) = get_index_progress(&pool, &baseline_table, "idx_embedding").await? {
+        let not_indexed = progress.rows_stable_not_indexed.unwrap_or(0);
+        if not_indexed == 0 {
+            println!("vector index already exists and is fully built");
+        } else {
+            println!("vector index exists, waiting for build to complete...");
+            wait_for_index_build(&pool, &args.db_name, &baseline_table, "idx_embedding").await?;
+        }
+    } else {
+        println!("> Creating vector index on TiFlash...");
+        create_vector_index(&pool, &baseline_table).await?;
+        wait_for_index_build(&pool, &args.db_name, &baseline_table, "idx_embedding").await?;
+    }
 
     let logger = Arc::new(QueryLogger::new(&args.output_file, &baseline_table)?);
     let samples = Arc::new(samples);
