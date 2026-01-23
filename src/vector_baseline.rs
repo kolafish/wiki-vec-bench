@@ -404,6 +404,7 @@ fn find_column<'a>(cols: &'a [sqlx::mysql::MySqlColumn], candidates: &[&str]) ->
 
 async fn get_index_progress(
     pool: &Pool<MySql>,
+    db_name: &str,
     table_name: &str,
     index_name: &str,
 ) -> Result<Option<IndexProgress>, Box<dyn std::error::Error>> {
@@ -421,7 +422,12 @@ async fn get_index_progress(
     }
 
     let cols = rows[0].columns();
-    let table_col = find_column(cols, &["table_name", "table", "tbl_name"])
+    let db_col = find_column(cols, &["table_schema", "db_name", "database", "tidb_database"])
+        .ok_or_else(|| {
+            let names: Vec<&str> = cols.iter().map(|c| c.name()).collect();
+            format!("missing database name column in tiflash_indexes: {:?}", names)
+        })?;
+    let table_col = find_column(cols, &["table_name", "table", "tbl_name", "tidb_table"])
         .ok_or_else(|| {
             let names: Vec<&str> = cols.iter().map(|c| c.name()).collect();
             format!("missing table name column in tiflash_indexes: {:?}", names)
@@ -442,15 +448,17 @@ async fn get_index_progress(
             format!("missing rows_stable_not_indexed column in tiflash_indexes: {:?}", names)
         })?;
 
+    let db_col = db_col.to_string();
     let table_col = table_col.to_string();
     let index_col = index_col.to_string();
     let indexed_col = indexed_col.to_string();
     let not_indexed_col = not_indexed_col.to_string();
 
     for row in rows.iter() {
+        let db_val: String = row.try_get(db_col.as_str())?;
         let table_val: String = row.try_get(table_col.as_str())?;
         let index_val: String = row.try_get(index_col.as_str())?;
-        if table_val == table_name && index_val == index_name {
+        if db_val == db_name && table_val == table_name && index_val == index_name {
             let indexed: i64 = row.try_get(indexed_col.as_str())?;
             let not_indexed: i64 = row.try_get(not_indexed_col.as_str())?;
             return Ok(Some(IndexProgress {
@@ -482,7 +490,7 @@ async fn wait_for_index_build(
             .into());
         }
 
-        let progress = get_index_progress(pool, table_name, index_name).await?;
+        let progress = get_index_progress(pool, db_name, table_name, index_name).await?;
 
         if let Some(p) = progress {
             let indexed = p.rows_stable_indexed.unwrap_or(0);
@@ -634,7 +642,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let replica_mgr = TiFlashReplicaManager::new(pool.clone(), args.db_name.clone());
     replica_mgr.ensure_replica(&baseline_table).await?;
 
-    if let Some(progress) = get_index_progress(&pool, &baseline_table, "idx_embedding").await? {
+    if let Some(progress) = get_index_progress(&pool, &args.db_name, &baseline_table, "idx_embedding").await? {
         let not_indexed = progress.rows_stable_not_indexed.unwrap_or(0);
         if not_indexed == 0 {
             println!("vector index already exists and is fully built");
