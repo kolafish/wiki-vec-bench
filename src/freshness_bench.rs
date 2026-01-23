@@ -143,7 +143,7 @@ fn build_read_query(table_name: &str, ts_text: &str, mode: SearchMode) -> String
             table_name, escaped
         ),
         SearchMode::TikvLike => format!(
-            "SELECT /*+ READ_FROM_STORAGE(TIKV[`{}`]) */ write_ts FROM `{}` WHERE write_ts_text LIKE '%{}%' LIMIT 1",
+            "SELECT /*+ READ_FROM_STORAGE(TIKV[`{}`]) */ write_ts FROM `{}` WHERE write_ts_text = '{}' LIMIT 1",
             table_name, table_name, escaped
         ),
     }
