@@ -159,3 +159,75 @@ cargo build --release
   --duration 120 \
   --write-interval-ms 5
 ```
+
+## AWS hybrid benchmark
+
+`aws-hybrid-bench` is the new end-to-end runner for the AWS TiDB + TiCI test flow:
+
+1. load parquet rows into a TiDB raw table
+2. build a `FULLTEXT(title, text)` index
+3. materialize a vector table with `VECTOR(384)`
+4. build a TiFlash vector index
+5. run inverted-only and vector-only query benchmarks
+6. emit `JSON`, `CSV`, and `Markdown` reports
+
+Example:
+
+```bash
+cargo build --release --bin aws-hybrid-bench
+
+./target/release/aws-hybrid-bench \
+  --db-host 127.0.0.1 \
+  --db-port 4000 \
+  --db-name test \
+  --dataset-dir data/raw \
+  --scale-rows 1000000 \
+  --query-concurrency 16 \
+  --query-duration 120 \
+  --sample-size 5000 \
+  --output-dir results
+```
+
+The dataset download script now supports downloading a bounded prefix of the
+Wikipedia embeddings dataset, which is enough for the `1M` and `10M` tiers:
+
+```bash
+python3 scripts/download_wiki_embeddings.py --rows 10000000
+```
+
+## AWS orchestration
+
+`scripts/aws_cluster_bench.py` orchestrates the AWS workflow around:
+
+- `/Users/jin/Desktop/terraform-tici`
+- the Linux builder host `janeyu@10.2.12.81`
+- the TiUP center VM created by `terraform-tici`
+
+It can:
+
+- rewrite Terraform node counts
+- run `terraform init/apply`
+- deploy the cluster from the center host with TiUP
+- package Linux hotfix tarballs from the builder host
+- patch `tidb`, `tiflash`, `tici_meta`, and `tici_worker`
+- sync this repo to the center host
+- download the dataset prefix on the center host
+- run the `1M` and `10M` benchmark tiers
+- fetch result artifacts back locally
+
+Example full flow:
+
+```bash
+python3 scripts/aws_cluster_bench.py all \
+  --scales 1000000,10000000 \
+  --n-tikv 3 \
+  --n-tiflash 1 \
+  --n-tici-worker 1
+```
+
+Current assumptions:
+
+- Terraform and AWS CLI run on the local machine.
+- The builder host `10.2.12.81` is only used to source Linux `ELF x86_64` binaries.
+- The center VM builds `aws-hybrid-bench` and runs the benchmark.
+- TiCI patch tarballs are generated from one `tici-server` binary plus wrapper entrypoints for `meta` and `worker`.

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Download half of the Wikipedia embeddings dataset from Hugging Face and
-materialize it as parquet under ./data/raw.
+Download a configurable prefix of the Wikipedia embeddings dataset from
+Hugging Face and materialize it as parquet under ./data/raw by default.
 Supports incremental download: skips shards that already exist and are valid.
 """
 
+import argparse
 from pathlib import Path
 import shutil
 import os
@@ -13,8 +14,8 @@ from datasets import load_dataset
 
 
 DATASET_NAME = "maloyan/wikipedia-22-12-en-embeddings-all-MiniLM-L6-v2"
-# Only load 50% of the train split to reduce download size.
-SPLIT = "train[:50%]"
+DEFAULT_ROWS = 10_000_000
+DEFAULT_NUM_SHARDS = 8
 
 
 def check_disk_space(path: Path, required_gb: float = 50.0) -> bool:
@@ -45,10 +46,34 @@ def is_valid_parquet(path: Path) -> bool:
         return False
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Download Wikipedia embeddings parquet shards")
+    parser.add_argument(
+        "--rows",
+        type=int,
+        default=DEFAULT_ROWS,
+        help=f"Number of rows to download from the train split (default: {DEFAULT_ROWS})",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=DEFAULT_NUM_SHARDS,
+        help=f"Number of parquet shards to write (default: {DEFAULT_NUM_SHARDS})",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Override the parquet output directory (default: <repo>/data/raw)",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     root = Path(__file__).resolve().parent.parent
     data_dir = root / "data"
-    raw_dir = data_dir / "raw"
+    raw_dir = args.output_dir or (data_dir / "raw")
 
     data_dir.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -56,7 +81,8 @@ def main() -> None:
     # Check disk space before starting
     check_disk_space(raw_dir)
 
-    num_shards = 8
+    split = f"train[:{args.rows}]"
+    num_shards = args.num_shards
     
     # Check which shards already exist and are valid
     existing_shards = set()
@@ -73,8 +99,8 @@ def main() -> None:
         print("All shards already exist and are valid. Nothing to download.", flush=True)
         return
     
-    print(f"Loading dataset {DATASET_NAME}:{SPLIT} from Hugging Face...", flush=True)
-    ds = load_dataset(DATASET_NAME, split=SPLIT)
+    print(f"Loading dataset {DATASET_NAME}:{split} from Hugging Face...", flush=True)
+    ds = load_dataset(DATASET_NAME, split=split)
 
     print(f"Saving dataset shards to parquet under {raw_dir} ...", flush=True)
     total_size = len(ds)
@@ -102,9 +128,8 @@ def main() -> None:
                 output_path.unlink()
             raise
 
-    print("Download finished. Parquet shards are stored under ./data/raw.", flush=True)
+    print(f"Download finished. Parquet shards are stored under {raw_dir}.", flush=True)
 
 
 if __name__ == "__main__":
     main()
-

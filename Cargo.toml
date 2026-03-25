@@ -19,6 +19,10 @@ path = "src/vector_baseline.rs"
 name = "freshness-bench"
 path = "src/freshness_bench.rs"
 
+[[bin]]
+name = "aws-hybrid-bench"
+path = "src/aws_hybrid_bench.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
@@ -28,3 +32,5 @@ chrono = { version = "0.4", features = ["serde"] }
 parquet = { version = "52", features = ["arrow"] }
 arrow-array = "52"
 arrow-schema = "52"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
