@@ -28,6 +28,8 @@ const QUERY_READINESS_SAMPLE_LIMIT: usize = 128;
 const QUERY_READINESS_SOAK_CONCURRENCY: usize = 4;
 const QUERY_READINESS_SOAK_DURATION_SECS: u64 = 5;
 const QUERY_READINESS_SUCCESS_ROUNDS: usize = 2;
+const QUERY_READINESS_MAX_ATTEMPTS: usize = 3;
+const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "AWS hybrid benchmark for TiDB + TiCI")]
@@ -64,6 +66,9 @@ struct Args {
 
     #[arg(long, default_value_t = 120)]
     query_duration: u64,
+
+    #[arg(long, default_value_t = DEFAULT_QUERY_TIMEOUT_SECS)]
+    query_timeout_secs: u64,
 
     #[arg(long, default_value_t = 5000)]
     sample_size: usize,
@@ -145,6 +150,14 @@ struct LatencySummary {
 }
 
 #[derive(Serialize)]
+struct LatencyBucket {
+    upper_bound_ms: Option<f64>,
+    label: String,
+    count: usize,
+    percentage: f64,
+}
+
+#[derive(Serialize)]
 struct LoadSummary {
     elapsed_secs: f64,
     rows: usize,
@@ -165,6 +178,7 @@ struct QuerySummary {
     qps: f64,
     errors: usize,
     latency_ms: LatencySummary,
+    latency_distribution: Vec<LatencyBucket>,
 }
 
 #[derive(Serialize)]
@@ -332,14 +346,17 @@ async fn wait_for_inverted_query_stable(
     let soak_duration = Duration::from_secs(QUERY_READINESS_SOAK_DURATION_SECS);
     let deadline = Instant::now() + Duration::from_secs(INDEX_BUILD_TIMEOUT_SECS);
     let mut stable_rounds = 0usize;
+    let mut attempts = 0usize;
 
     while Instant::now() < deadline {
+        attempts += 1;
         let summary = run_inverted_query_benchmark(
             pool.clone(),
             table_name.to_string(),
             readiness_samples.clone(),
             soak_concurrency,
             soak_duration,
+            Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS),
             operator,
         )
         .await?;
@@ -362,6 +379,13 @@ async fn wait_for_inverted_query_stable(
             QUERY_READINESS_SUCCESS_ROUNDS
         );
         io::stdout().flush().ok();
+        if attempts >= QUERY_READINESS_MAX_ATTEMPTS {
+            println!(
+                "\n! Continuing inverted benchmark on {} despite readiness errors after {} attempts",
+                table_name, attempts
+            );
+            return Ok(());
+        }
         tokio::time::sleep(Duration::from_secs(TIFLASH_CHECK_INTERVAL_SECS)).await;
     }
 
@@ -387,14 +411,17 @@ async fn wait_for_vector_query_stable(
     let soak_duration = Duration::from_secs(QUERY_READINESS_SOAK_DURATION_SECS);
     let deadline = Instant::now() + Duration::from_secs(INDEX_BUILD_TIMEOUT_SECS);
     let mut stable_rounds = 0usize;
+    let mut attempts = 0usize;
 
     while Instant::now() < deadline {
+        attempts += 1;
         let summary = run_vector_query_benchmark(
             pool.clone(),
             table_name.to_string(),
             readiness_samples.clone(),
             soak_concurrency,
             soak_duration,
+            Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS),
             topk,
         )
         .await?;
@@ -417,6 +444,13 @@ async fn wait_for_vector_query_stable(
             QUERY_READINESS_SUCCESS_ROUNDS
         );
         io::stdout().flush().ok();
+        if attempts >= QUERY_READINESS_MAX_ATTEMPTS {
+            println!(
+                "\n! Continuing vector benchmark on {} despite readiness errors after {} attempts",
+                table_name, attempts
+            );
+            return Ok(());
+        }
         tokio::time::sleep(Duration::from_secs(TIFLASH_CHECK_INTERVAL_SECS)).await;
     }
 
@@ -463,6 +497,52 @@ fn build_latency_summary(latencies_ms: &mut [f64]) -> LatencySummary {
         p99_ms: latencies_ms[(len * 99 / 100).min(len - 1)],
         max_ms: *latencies_ms.last().unwrap_or(&0.0),
     }
+}
+
+fn build_latency_distribution(latencies_ms: &[f64]) -> Vec<LatencyBucket> {
+    const BUCKET_BOUNDS_MS: [f64; 10] =
+        [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0];
+
+    let mut counts = vec![0usize; BUCKET_BOUNDS_MS.len() + 1];
+    for &latency_ms in latencies_ms {
+        let mut bucket_idx = BUCKET_BOUNDS_MS.len();
+        for (idx, bound_ms) in BUCKET_BOUNDS_MS.iter().enumerate() {
+            if latency_ms <= *bound_ms {
+                bucket_idx = idx;
+                break;
+            }
+        }
+        counts[bucket_idx] += 1;
+    }
+
+    let total = latencies_ms.len() as f64;
+    let mut buckets = Vec::with_capacity(counts.len());
+    let mut lower_bound_ms = 0.0;
+    for (idx, count) in counts.into_iter().enumerate() {
+        let (upper_bound_ms, label) = if idx < BUCKET_BOUNDS_MS.len() {
+            let upper = BUCKET_BOUNDS_MS[idx];
+            let label = if idx == 0 {
+                format!("<= {:.0}ms", upper)
+            } else {
+                format!("({:.0}, {:.0}]ms", lower_bound_ms, upper)
+            };
+            lower_bound_ms = upper;
+            (Some(upper), label)
+        } else {
+            (None, format!("> {:.0}ms", lower_bound_ms))
+        };
+        buckets.push(LatencyBucket {
+            upper_bound_ms,
+            label,
+            count,
+            percentage: if total > 0.0 {
+                count as f64 * 100.0 / total
+            } else {
+                0.0
+            },
+        });
+    }
+    buckets
 }
 
 fn create_hybrid_table_name(scale_rows: usize) -> String {
@@ -739,9 +819,8 @@ async fn fetch_samples(
     limit: usize,
 ) -> Result<Vec<SampleRow>, sqlx::Error> {
     let sql = format!(
-        "SELECT /*+ READ_FROM_STORAGE(TIKV[`{0}`]) */ title_kw, vector_text \
-         FROM `{0}` IGNORE INDEX (`{1}`) LIMIT {2}",
-        table_name, HYBRID_INDEX_NAME, limit
+        "SELECT title_kw, vector_text FROM `{}` LIMIT {}",
+        table_name, limit
     );
     sqlx::query_as(&sql).fetch_all(pool).await
 }
@@ -752,6 +831,7 @@ async fn run_inverted_query_benchmark(
     sample_rows: Vec<SampleRow>,
     concurrency: usize,
     duration: Duration,
+    timeout: Duration,
     operator: InvertedOperator,
 ) -> Result<QuerySummary, Box<dyn std::error::Error>> {
     let sample_rows = Arc::new(sample_rows);
@@ -771,9 +851,14 @@ async fn run_inverted_query_benchmark(
                 };
                 let sql = build_inverted_query_sql(&table_name, &sample.title_kw, operator);
                 let query_start = Instant::now();
-                match sqlx::query_scalar::<_, i64>(&sql).fetch_one(&pool).await {
-                    Ok(_) => acc.latencies_us.push(query_start.elapsed().as_micros()),
-                    Err(_) => acc.errors += 1,
+                match tokio::time::timeout(
+                    timeout,
+                    sqlx::query_scalar::<_, i64>(&sql).fetch_one(&pool),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => acc.latencies_us.push(query_start.elapsed().as_micros()),
+                    Ok(Err(_)) | Err(_) => acc.errors += 1,
                 }
             }
             acc
@@ -794,6 +879,7 @@ async fn run_inverted_query_benchmark(
 
     let elapsed = started.elapsed();
     let queries = all_latencies_ms.len();
+    let latency_distribution = build_latency_distribution(&all_latencies_ms);
     let latency_ms = build_latency_summary(&mut all_latencies_ms);
     Ok(QuerySummary {
         elapsed_secs: elapsed.as_secs_f64(),
@@ -801,6 +887,7 @@ async fn run_inverted_query_benchmark(
         qps: queries as f64 / elapsed.as_secs_f64(),
         errors,
         latency_ms,
+        latency_distribution,
     })
 }
 
@@ -810,6 +897,7 @@ async fn run_vector_query_benchmark(
     sample_rows: Vec<SampleRow>,
     concurrency: usize,
     duration: Duration,
+    timeout: Duration,
     topk: usize,
 ) -> Result<QuerySummary, Box<dyn std::error::Error>> {
     let sample_rows = Arc::new(sample_rows);
@@ -829,9 +917,9 @@ async fn run_vector_query_benchmark(
                 };
                 let sql = build_vector_query_sql(&table_name, &sample.vector_text, topk);
                 let query_start = Instant::now();
-                match sqlx::query(&sql).fetch_all(&pool).await {
-                    Ok(_) => acc.latencies_us.push(query_start.elapsed().as_micros()),
-                    Err(_) => acc.errors += 1,
+                match tokio::time::timeout(timeout, sqlx::query(&sql).fetch_all(&pool)).await {
+                    Ok(Ok(_)) => acc.latencies_us.push(query_start.elapsed().as_micros()),
+                    Ok(Err(_)) | Err(_) => acc.errors += 1,
                 }
             }
             acc
@@ -852,6 +940,7 @@ async fn run_vector_query_benchmark(
 
     let elapsed = started.elapsed();
     let queries = all_latencies_ms.len();
+    let latency_distribution = build_latency_distribution(&all_latencies_ms);
     let latency_ms = build_latency_summary(&mut all_latencies_ms);
     Ok(QuerySummary {
         elapsed_secs: elapsed.as_secs_f64(),
@@ -859,6 +948,7 @@ async fn run_vector_query_benchmark(
         qps: queries as f64 / elapsed.as_secs_f64(),
         errors,
         latency_ms,
+        latency_distribution,
     })
 }
 
@@ -1006,6 +1096,14 @@ fn write_markdown(report: &RunReport, output_dir: &Path) -> Result<(), Box<dyn s
             summary.latency_ms.max_ms,
             summary.errors
         )?;
+        writeln!(file, "- Distribution:")?;
+        for bucket in &summary.latency_distribution {
+            writeln!(
+                file,
+                "  - `{}`: `{}` queries (`{:.2}%`)",
+                bucket.label, bucket.count, bucket.percentage
+            )?;
+        }
     }
 
     if let Some(summary) = &report.vector_query {
@@ -1025,6 +1123,14 @@ fn write_markdown(report: &RunReport, output_dir: &Path) -> Result<(), Box<dyn s
             summary.latency_ms.max_ms,
             summary.errors
         )?;
+        writeln!(file, "- Distribution:")?;
+        for bucket in &summary.latency_distribution {
+            writeln!(
+                file,
+                "  - `{}`: `{}` queries (`{:.2}%`)",
+                bucket.label, bucket.count, bucket.percentage
+            )?;
+        }
     }
 
     Ok(())
@@ -1040,10 +1146,6 @@ async fn drop_table_if_exists(pool: &Pool<MySql>, table_name: &str) -> Result<()
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let started_at = Local::now();
-
-    if args.skip_inverted && args.skip_vector {
-        return Err("both --skip-inverted and --skip-vector are enabled".into());
-    }
 
     let mut connect_options = MySqlConnectOptions::new()
         .host(&args.db_host)
@@ -1116,10 +1218,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         PathBuf::from(&args.output_dir).join(format!("scale_{}", effective_scale_rows));
     fs::create_dir_all(&output_dir)?;
 
-    let sample_rows = fetch_samples(&pool, &table_name, args.sample_size).await?;
-    if sample_rows.is_empty() {
-        return Err("no samples available after load".into());
-    }
+    let sample_rows = if args.skip_inverted && args.skip_vector {
+        Vec::new()
+    } else {
+        let rows = fetch_samples(&pool, &table_name, args.sample_size).await?;
+        if rows.is_empty() {
+            return Err("no samples available after load".into());
+        }
+        rows
+    };
 
     let inverted_query = if args.skip_inverted {
         None
@@ -1142,6 +1249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sample_rows.clone(),
                 args.query_concurrency,
                 Duration::from_secs(args.query_duration),
+                Duration::from_secs(args.query_timeout_secs),
                 args.inverted_operator,
             )
             .await?,
@@ -1169,6 +1277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sample_rows.clone(),
                 args.query_concurrency,
                 Duration::from_secs(args.query_duration),
+                Duration::from_secs(args.query_timeout_secs),
                 args.vector_topk,
             )
             .await?,
