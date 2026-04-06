@@ -1,0 +1,35 @@
+{
+  "table_name": "nv_reg_fulltext_1775479477",
+  "table_id": 341,
+  "index_mode": "fulltext",
+  "scale_rows": 1000000,
+  "write_summary": {
+    "rows": 1000000,
+    "elapsed_secs": 218.8380904197693,
+    "rows_per_sec": 4569.5884024660745,
+    "batches": 2000,
+    "batch_latency_ms": {
+      "p50_ms": 33.66208076477051,
+      "p95_ms": 37.42241859436035,
+      "p99_ms": 40.35377502441406,
+      "max_ms": 235.825777053833
+    }
+  },
+  "cdc_summary": {
+    "write_start_epoch_ms": 1775479478054,
+    "write_end_epoch_ms": 1775479696892,
+    "first_worker_seen_secs": 3.941,
+    "cdc_done_after_write_secs": 6.583,
+    "end_to_end_secs": 225.421,
+    "matched_done_line": "[2026/04/06 12:48:23.475 +00:00] [INFO] [service.rs:291] [\"compact_fragments: finish_compact_frags success finish_req=FinishCompactFragRequest { addr: \\\"172.31.11.1:8510\\\", shard: Some(SMH(shard_id=60004/range=748000000000000155..748000000000000156/epoch=1)), keyspace_id: 4294967295, table_id: 341, index_id: 1, seq: 45, timestamp: 1775479677585, leader_term: \\\"6330545273626479856\\\", input_frags: [Frag { fv: 1, P: wiki-vec-bench/frags/t_341/i_1/f_465431333639290892, segs: [0b83e03c55ca4185be3af9cb06e5640a/, aae6482c90c84b3ba28be1973010f480/], prop: FragProp { c/s: 708500/451088946, range: 7480000000000001555f728000000000000001..7480000000000001555f7280000000000acf94, mid: [1]7480000000000001555f728000000000056801 } }, Frag { fv: 1, P: wiki-vec-bench/frags/t_341/i_1/f_465431340690964482, segs: [f90400852fd14cbda77e47d4b4c61169/, b4a549d5bdb744f38ee692b493026915/], prop: FragProp { c/s: 123861/75353519, range: 7480000000000001555f7280000000000acf95..7480000000000001555f7280000000000cb369, mid: [1]7480000000000001555f7280000000000bbf95 } }, Frag { fv: 1, P: wiki-vec-bench/frags/t_341/i_1/f_465431340520833034, segs: [1e7180db81fd457286ec334380a9af61/, b7b8cfaa706340a99f7f88df5f5d9438/, 7e9518cd11af40d49f61050977e6046a/, d0cb3349c9b94bbf898d9cf7d5d1f57f/], prop: FragProp { c/s: 20052/13011359, range: 7480000000000001555f7280000000000cb36a..7480000000000001555f7280000000000d01bd, mid: [1]7480000000000001555f7280000000000cda94 } }, Frag { fv: 1, P: wiki-vec-bench/frags/t_341/i_1/f_465431341831290891, segs: [3e497aafee4f4ba7a437b0d4d161a3ed/, 38779f834383418ba3683c28ffe9bdd9/, 41d09c79bdb54d20ac0682d5e259b68a/, a5aa12a1f5a24cc9b5faf11e37bebdf0/], prop: FragProp { c/s: 20087/12972035, range: 7480000000000001555f7280000000000d01be..7480000000000001555f7280000000000d5034, mid: [1]7480000000000001555f7280000000000d28f9 } }, Frag { fv: 1, P: wiki-vec-bench/frags/t_341/i_1/f_465431343142010891, segs: [49edfee3ada844918a44f1c6f1ed4215/, ca0823cca9044707aaf8f345e83978a5/, 52b80cfc7418416599c5d072f6ea5220/, d98e409acf0e4145b0843c2955e3d4cb/], prop: FragProp { c/s: 23990/15300960, range: 7480000000000001555f7280000000000d5035..7480000000000001555f7280000000000dadea, mid: [1]7480000000000001555f7280000000000d7f10 } }], output_frags: [Frag { fv: 1, P: wiki-vec-bench/frags/t_341/i_1/f_465431344596910090, segs: [c0aacfd690134a81b8d6db8433b5fa62/, 69c67403062044e6be06ae95dfb0e5f1/], prop: FragProp { c/s: 896490/564288985, range: 7480000000000001555f728000000000000001..7480000000000001555f7280000000000dadea, mid: [1]7480000000000001555f72800000000006d801 } }] }\"] [mod=tici::worker::service]"
+  },
+  "warmup_summary": {
+    "restart_epoch_ms": 1775479737562,
+    "restore_done_elapsed_secs": null,
+    "first_query_ready_secs": null,
+    "shard_add_count": 1,
+    "first_shard_add_secs": 10.667737007141113,
+    "last_shard_add_secs": 10.667737007141113,
+    "matched_restore_line": "[2026/04/06 12:48:58.479 +00:00] [INFO] [reader_server.rs:422] [\"restore: done, 8 parallelism, 0 shards, 0 errors, use 124.542\u00b5s\"] [mod=tici_search_lib::reader_server]"
+  }
+}

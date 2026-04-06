@@ -1,0 +1,35 @@
+{
+  "table_name": "nv_reg_hybrid_inverted_1775478937",
+  "table_id": 338,
+  "index_mode": "hybrid_inverted",
+  "scale_rows": 1000000,
+  "write_summary": {
+    "rows": 1000000,
+    "elapsed_secs": 209.39875078201294,
+    "rows_per_sec": 4775.577677829674,
+    "batches": 2000,
+    "batch_latency_ms": {
+      "p50_ms": 34.27934646606445,
+      "p95_ms": 38.06662559509277,
+      "p99_ms": 40.81082344055176,
+      "max_ms": 296.9367504119873
+    }
+  },
+  "cdc_summary": {
+    "write_start_epoch_ms": 1775478937330,
+    "write_end_epoch_ms": 1775479146728,
+    "first_worker_seen_secs": 26.299,
+    "cdc_done_after_write_secs": 7.854,
+    "end_to_end_secs": 217.252,
+    "matched_done_line": "[2026/04/06 12:39:14.582 +00:00] [INFO] [frag_uploader.rs:367] [\"submit_frag_success, t_338/i_1/s_60003, submit_info=SubmitInfo { is_base: false, frag_meta: Some(Frag { fv: 1, P: wiki-vec-bench/frags/t_338/i_1/f_465431206119342087, segs: [a62b2b97504446f5ab85c871734795b5/, 90217d26ecf4429f8499fb60e2728f2b/, 23534ad7619c4e089fbf7a660da64d04/, e481c48114ae418fb08935b4bd4d2073/], prop: FragProp { c/s: 846/45603, range: 7480000000000001525f69800000000000000101416e647265772052ff616e6e656c6c7300fe0380000000000f3f29..7480000000000001525f698000000000000001015477697374656420ff5369737465720000fd0380000000000f4010, mid: [1]7480000000000001525f698000000000000001014e65757472696e6fff0000000000000000f70380000000000f417b } }), last_cdc_file: Some(\\\"wiki-vec-bench/cdc/338/465431150531706901/2026-04-06/CDC00000000000000000178.json\\\"), frag_path: \\\"/home/ubuntu/tici-worker-data/fragments/t_338/i_1/f_465431206119342087\\\" }, elapsed_ms=7\"] [mod=tici_shard::writer::frag_uploader]"
+  },
+  "warmup_summary": {
+    "restart_epoch_ms": 1775479188479,
+    "restore_done_elapsed_secs": null,
+    "first_query_ready_secs": 2.151089668273926,
+    "shard_add_count": 1,
+    "first_shard_add_secs": 3.2043168544769287,
+    "last_shard_add_secs": 3.2043168544769287,
+    "matched_restore_line": "[2026/04/06 12:39:49.384 +00:00] [INFO] [reader_server.rs:409] [\"restore: done, 8 parallelism, 0 shards, 0 errors, use 116.144\u00b5s\"] [mod=tici_search_lib::reader_server]"
+  }
+}
